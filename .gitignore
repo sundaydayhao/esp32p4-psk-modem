@@ -1,0 +1,5 @@
+build/
+managed_components/
+.vscode/
+*.pyc
+__pycache__/
