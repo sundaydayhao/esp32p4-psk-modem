@@ -1543,8 +1543,9 @@ static uint8_t psk8_soft_bit(float angle, int bit)
 
 static void push_8psk_soft_bits(psk_rtty_rx_t *rx, float angle)
 {
+    const float demap_angle = angle == 0.0f ? 0.0f : TWO_PI - angle;
     for (int bit = 2; bit >= 0; --bit) {
-        const uint8_t soft = psk8_soft_bit(angle, bit);
+        const uint8_t soft = psk8_soft_bit(demap_angle, bit);
         const int distance = (int)soft - 128;
         if (distance > -8 && distance < 8) {
             rx->debug_soft_ambiguous++;

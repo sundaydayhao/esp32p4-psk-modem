@@ -169,11 +169,14 @@ uint8_t psk_codec_phase_index_from_symbol(psk_mode_family_t family, uint8_t fec,
         return (uint8_t)((symbol & 1U) ? 0U : 2U);
     }
     if (family == PSK_MODE_FAMILY_QPSK) {
-        static const uint8_t map[4] = {0U, 3U, 2U, 1U};
+        /* Receiver-observed inverse of fldigi's QPSK TX mapping:
+         * tx sym -> (4 - sym) quarter-turns, with this audio I/Q convention. */
+        static const uint8_t map[4] = {2U, 3U, 0U, 1U};
         return map[symbol & 3U];
     }
     if (fec) {
-        static const uint8_t map_fec[8] = {0U, 1U, 3U, 2U, 7U, 6U, 4U, 5U};
+        /* fldigi graymapped_8psk_pos, negated for this TX/RX phase convention. */
+        static const uint8_t map_fec[8] = {0U, 7U, 5U, 6U, 1U, 2U, 4U, 3U};
         return map_fec[symbol & 7U];
     }
     static const uint8_t map[8] = {4U, 3U, 2U, 1U, 0U, 7U, 6U, 5U};
@@ -186,11 +189,13 @@ uint8_t psk_codec_symbol_from_phase_index(psk_mode_family_t family, uint8_t fec,
         return (uint8_t)((phase_idx & 1U) ? 0U : 2U);
     }
     if (family == PSK_MODE_FAMILY_QPSK) {
-        static const uint8_t map[4] = {0U, 3U, 2U, 1U};
+        /* See psk_codec_phase_index_from_symbol(); the QPSK map is self-inverse. */
+        static const uint8_t map[4] = {2U, 3U, 0U, 1U};
         return map[phase_idx & 3U];
     }
     if (fec) {
-        static const uint8_t map_fec[8] = {0U, 1U, 3U, 2U, 6U, 7U, 5U, 4U};
+        /* Inverse of the receiver-observed fldigi Gray 8PSK FEC constellation. */
+        static const uint8_t map_fec[8] = {0U, 4U, 5U, 7U, 6U, 2U, 3U, 1U};
         return map_fec[phase_idx & 7U];
     }
     static const uint8_t map[8] = {4U, 3U, 2U, 1U, 0U, 7U, 6U, 5U};
