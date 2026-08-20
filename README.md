@@ -30,8 +30,8 @@
 ```text
 ESP32-P4 BSP microphone / I2S
     -> audio_input.c
-    -> modem.c
-    -> decoder_layer.c
+    -> rx_modem.c
+    -> rx_decoder.c
     -> mode backend
     -> decoded bytes
     -> transport.c
@@ -41,8 +41,8 @@ ESP32-P4 BSP microphone / I2S
 
 - `main/audio_input.c`：ESP32-P4 BSP 麦克风输入、采样和抽取。
 - `main/display.c`：ESP32-P4 BSP/LVGL 显示、瀑布图和触摸调谐。
-- `main/modem.c`：公开 modem API、模式切换、频点设置和输出缓冲。
-- `main/decoder_layer.c`：统一解码层，按模式 family 分发到后端。
+- `main/rx_modem.c`：公开 modem API、模式切换、频点设置和输出缓冲。
+- `main/rx_decoder.c`：统一解码层，按模式 family 分发到后端。
 - `components/psk_rtty`：PSK/RTTY 后端。
 - `components/ft8lib`：FT8/FT4 后端。
 

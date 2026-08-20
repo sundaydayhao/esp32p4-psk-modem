@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #include "modem_types.h"
-#include "decoder_layer.h"
+#include "rx_decoder.h"
 
 typedef struct {
     modem_mode_t mode;

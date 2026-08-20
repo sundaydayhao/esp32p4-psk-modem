@@ -1,7 +1,7 @@
 #pragma once
 
 #include "esp_err.h"
-#include "modem.h"
+#include "rx_modem.h"
 #include "spectrum.h"
 #include "transport.h"
 

@@ -13,7 +13,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
-#include "modem.h"
+#include "rx_modem.h"
 #include "psk_tx.h"
 #include "spectrum.h"
 #include "transport.h"
