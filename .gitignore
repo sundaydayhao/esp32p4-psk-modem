@@ -1,0 +1,29 @@
+# ESP-IDF build output
+build/
+sdkconfig.old
+
+# ESP-IDF component manager cache/output
+managed_components/
+.component_hash
+
+# Python/test/cache files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+
+# Logs and generated binaries
+*.log
+*.elf
+*.bin
+*.map
+
+
+.magic-lamp-cache/

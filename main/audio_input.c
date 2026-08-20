@@ -1,0 +1,189 @@
+#include "audio_input.h"
+
+#include <math.h>
+#include <stdbool.h>
+#include <string.h>
+
+#include "audio_decim.h"
+#include "board_config.h"
+#include "bsp/esp-bsp.h"
+#include "driver/i2s_std.h"
+#include "esp_attr.h"
+#include "esp_check.h"
+#include "esp_codec_dev.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+
+static const char *TAG = "audio";
+static esp_codec_dev_handle_t s_mic_dev;
+static audio_decim_state_t s_decim_state;
+static int16_t s_raw_samples[1536];
+
+#define AUDIO_INPUT_CAPTURE_MAX_SAMPLES 32768U
+static int16_t s_capture[AUDIO_INPUT_CAPTURE_MAX_SAMPLES] EXT_RAM_BSS_ATTR;
+static volatile size_t s_capture_limit;
+static volatile size_t s_capture_count;
+static volatile bool s_capture_active;
+
+static void capture_samples(const int16_t *samples, size_t count)
+{
+    if (!s_capture_active || !samples || count == 0) {
+        return;
+    }
+
+    size_t captured = s_capture_count;
+    const size_t limit = s_capture_limit;
+    for (size_t i = 0; i < count && captured < limit; ++i) {
+        s_capture[captured++] = samples[i];
+    }
+    s_capture_count = captured;
+    if (captured >= limit) {
+        s_capture_active = false;
+    }
+}
+
+esp_err_t audio_input_init(void)
+{
+    audio_decim_init(&s_decim_state);
+
+    i2s_std_config_t i2s_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(BOARD_CODEC_SAMPLE_RATE_HZ),
+        .slot_cfg = I2S_STD_PHILIP_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = BOARD_AUDIO_I2S_MCLK,
+            .bclk = BOARD_AUDIO_I2S_BCLK,
+            .ws = BOARD_AUDIO_I2S_WS,
+            .dout = BOARD_AUDIO_I2S_DOUT,
+            .din = BOARD_AUDIO_I2S_DIN,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+    i2s_cfg.clk_cfg.mclk_multiple = BOARD_AUDIO_MCLK_MULTIPLE;
+
+    ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "bsp i2c init");
+    ESP_RETURN_ON_ERROR(bsp_audio_init(&i2s_cfg), TAG, "bsp audio init");
+
+    s_mic_dev = bsp_audio_codec_microphone_init();
+    ESP_RETURN_ON_FALSE(s_mic_dev, ESP_ERR_NO_MEM, TAG, "microphone codec init");
+
+    esp_codec_dev_sample_info_t fs = {
+        .bits_per_sample = 16,
+        .channel = 1,
+        .channel_mask = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(BOARD_AUDIO_INPUT_CHANNEL),
+        .sample_rate = BOARD_CODEC_SAMPLE_RATE_HZ,
+        .mclk_multiple = BOARD_AUDIO_MCLK_MULTIPLE,
+    };
+    ESP_RETURN_ON_FALSE(esp_codec_dev_open(s_mic_dev, &fs) == ESP_CODEC_DEV_OK,
+                        ESP_FAIL, TAG, "open microphone codec");
+
+    ESP_LOGI(TAG, "ESP32-P4 BSP microphone ready: codec %d Hz, modem %d Hz",
+             BOARD_CODEC_SAMPLE_RATE_HZ, BOARD_MODEM_SAMPLE_RATE_HZ);
+    return ESP_OK;
+}
+
+size_t audio_input_read(int16_t *samples, size_t max_samples, uint32_t timeout_ms)
+{
+    (void)timeout_ms;
+    if (!samples || max_samples == 0 || !s_mic_dev) {
+        return 0;
+    }
+
+    const size_t decim = BOARD_CODEC_SAMPLE_RATE_HZ / BOARD_MODEM_SAMPLE_RATE_HZ;
+    if (decim == 0 || BOARD_CODEC_SAMPLE_RATE_HZ % BOARD_MODEM_SAMPLE_RATE_HZ != 0) {
+        ESP_LOGE(TAG, "unsupported codec/modem sample rates");
+        return 0;
+    }
+
+    if (max_samples > 512) {
+        max_samples = 512;
+    }
+
+    const size_t raw_count = max_samples * decim;
+    const size_t raw_limit = sizeof(s_raw_samples) / sizeof(s_raw_samples[0]);
+    const size_t read_count = raw_count < raw_limit ? raw_count : raw_limit;
+    const int read_bytes = esp_codec_dev_read(s_mic_dev, s_raw_samples,
+                                              (int)(read_count * sizeof(s_raw_samples[0])));
+    if (read_bytes <= 0) {
+        return 0;
+    }
+
+    const size_t got_samples = (size_t)read_bytes / sizeof(s_raw_samples[0]);
+    const size_t out_count = audio_decim_process(&s_decim_state, s_raw_samples,
+                                                 got_samples, samples, (uint32_t)decim);
+    capture_samples(samples, out_count);
+
+#if BOARD_AUDIO_DEBUG_LOGS
+    static int64_t last_log_us;
+    const int64_t now_us = esp_timer_get_time();
+    if (now_us - last_log_us >= 1000000) {
+        last_log_us = now_us;
+        int16_t s_min = INT16_MAX;
+        int16_t s_max = INT16_MIN;
+        int64_t s_abs_sum = 0;
+        int64_t s_sum_sq = 0;
+        for (size_t i = 0; i < out_count; ++i) {
+            const int16_t sample = samples[i];
+            if (sample < s_min) {
+                s_min = sample;
+            }
+            if (sample > s_max) {
+                s_max = sample;
+            }
+            s_abs_sum += sample < 0 ? -(int32_t)sample : sample;
+            s_sum_sq += (int32_t)sample * (int32_t)sample;
+        }
+        const int32_t rms = out_count ? (int32_t)sqrt((double)s_sum_sq / (double)out_count) : 0;
+        ESP_LOGI(TAG, "rx bytes=%d raw=%u out=%u S[%d,%d] abs=%d rms=%d",
+                 read_bytes, (unsigned)got_samples, (unsigned)out_count, s_min, s_max,
+                 out_count ? (int)(s_abs_sum / (int64_t)out_count) : 0, (int)rms);
+    }
+#endif
+
+    return out_count;
+}
+
+esp_err_t audio_input_capture_start(size_t max_samples)
+{
+    if (max_samples == 0 || max_samples > AUDIO_INPUT_CAPTURE_MAX_SAMPLES) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    s_capture_active = false;
+    s_capture_count = 0;
+    s_capture_limit = max_samples;
+    s_capture_active = true;
+    return ESP_OK;
+}
+
+void audio_input_capture_stop(void)
+{
+    s_capture_active = false;
+}
+
+int audio_input_capture_active(void)
+{
+    return s_capture_active ? 1 : 0;
+}
+
+size_t audio_input_capture_count(void)
+{
+    return s_capture_count;
+}
+
+size_t audio_input_capture_copy(size_t offset, int16_t *samples, size_t max_samples)
+{
+    const size_t count = s_capture_count;
+    if (!samples || offset >= count || max_samples == 0) {
+        return 0;
+    }
+    size_t copied = count - offset;
+    if (copied > max_samples) {
+        copied = max_samples;
+    }
+    memcpy(samples, &s_capture[offset], copied * sizeof(samples[0]));
+    return copied;
+}
