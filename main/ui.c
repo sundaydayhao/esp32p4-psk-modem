@@ -245,7 +245,36 @@ static int parse_serial_mode_command(const char *cmd, ui_event_t *event)
     return 0;
 }
 
-static ui_event_t poll_serial_command(void)
+static int parse_serial_tx_command(const char *cmd, const display_state_t *display_state, ui_event_t *event)
+{
+    while (*cmd == ' ' || *cmd == '\t') {
+        cmd++;
+    }
+    if (*cmd == '@') {
+        cmd++;
+    }
+    while (*cmd == ' ' || *cmd == '\t') {
+        cmd++;
+    }
+    if (!cmd_starts(cmd, "TX")) {
+        return 0;
+    }
+    cmd += 2;
+    cmd = skip_spaces(cmd);
+    if (*cmd == '\0') {
+        cmd = "CQ CQ TEST";
+    }
+
+    event->type = UI_EVENT_TX_REQUEST;
+    event->tx_request.mode = display_state->selected_mode;
+    event->tx_request.psk_mode = display_state->selected_psk_mode;
+    event->tx_request.tone_hz = display_state->rx_tone_hz;
+    strncpy(event->tx_request.text, cmd, sizeof(event->tx_request.text) - 1);
+    event->tx_request.text[sizeof(event->tx_request.text) - 1] = '\0';
+    return 1;
+}
+
+static ui_event_t poll_serial_command(const display_state_t *display_state)
 {
     ui_event_t event = { .type = UI_EVENT_NONE };
     uint8_t data[32];
@@ -264,6 +293,8 @@ static ui_event_t poll_serial_command(void)
                     if (s_serial_cmd[0] == '@') {
                         if (handle_capture_command(s_serial_cmd + 1)) {
                             ESP_LOGI(TAG, "serial capture command: %s", s_serial_cmd);
+                        } else if (parse_serial_tx_command(s_serial_cmd, display_state, &event)) {
+                            ESP_LOGI(TAG, "serial tx command: %s", s_serial_cmd);
                         } else if (parse_serial_mode_command(s_serial_cmd, &event)) {
                             ESP_LOGI(TAG, "serial mode command: %s", s_serial_cmd);
                         } else {
@@ -312,7 +343,7 @@ ui_event_t ui_poll(const display_state_t *display_state)
     display_task_handler();
     finish_pending_capture_dump();
 
-    event = poll_serial_command();
+    event = poll_serial_command(display_state);
     if (event.type != UI_EVENT_NONE) {
         return event;
     }

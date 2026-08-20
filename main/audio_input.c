@@ -16,6 +16,7 @@
 
 static const char *TAG = "audio";
 static esp_codec_dev_handle_t s_mic_dev;
+static esp_codec_dev_handle_t s_spk_dev;
 static audio_decim_state_t s_decim_state;
 static int16_t s_raw_samples[1536];
 
@@ -69,6 +70,8 @@ esp_err_t audio_input_init(void)
 
     s_mic_dev = bsp_audio_codec_microphone_init();
     ESP_RETURN_ON_FALSE(s_mic_dev, ESP_ERR_NO_MEM, TAG, "microphone codec init");
+    s_spk_dev = bsp_audio_codec_speaker_init();
+    ESP_RETURN_ON_FALSE(s_spk_dev, ESP_ERR_NO_MEM, TAG, "speaker codec init");
 
     esp_codec_dev_sample_info_t fs = {
         .bits_per_sample = 16,
@@ -79,6 +82,8 @@ esp_err_t audio_input_init(void)
     };
     ESP_RETURN_ON_FALSE(esp_codec_dev_open(s_mic_dev, &fs) == ESP_CODEC_DEV_OK,
                         ESP_FAIL, TAG, "open microphone codec");
+    ESP_RETURN_ON_FALSE(esp_codec_dev_open(s_spk_dev, &fs) == ESP_CODEC_DEV_OK,
+                        ESP_FAIL, TAG, "open speaker codec");
 
     ESP_LOGI(TAG, "ESP32-P4 BSP microphone ready: codec %d Hz, modem %d Hz",
              BOARD_CODEC_SAMPLE_RATE_HZ, BOARD_MODEM_SAMPLE_RATE_HZ);
@@ -144,6 +149,17 @@ size_t audio_input_read(int16_t *samples, size_t max_samples, uint32_t timeout_m
 #endif
 
     return out_count;
+}
+
+esp_err_t audio_output_write(const int16_t *samples, size_t count)
+{
+    if (!samples || count == 0 || !s_spk_dev) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const int written = esp_codec_dev_write(s_spk_dev, (void *)samples,
+                                            (int)(count * sizeof(samples[0])));
+    return written < 0 ? ESP_FAIL : ESP_OK;
 }
 
 esp_err_t audio_input_capture_start(size_t max_samples)

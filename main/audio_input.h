@@ -7,6 +7,7 @@
 
 esp_err_t audio_input_init(void);
 size_t audio_input_read(int16_t *samples, size_t max_samples, uint32_t timeout_ms);
+esp_err_t audio_output_write(const int16_t *samples, size_t count);
 
 /* Capture the post-decimation stream used by the decoder.  This makes the
  * board audio path reproducible in the native WAV regression tool. */

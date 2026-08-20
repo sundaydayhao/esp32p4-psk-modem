@@ -12,10 +12,11 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
-#include "modem.h"
+#include "rx_modem.h"
 #include "spectrum.h"
 #include "transport.h"
 #include "ui.h"
+#include "psk_tx.h"
 
 static const char *TAG = "psk-modem";
 #define TWO_PI_F 6.28318530717958647692f
@@ -37,6 +38,8 @@ static modem_t s_audio_modem;
 static int16_t s_audio_samples[256];
 static char s_audio_decoded[sizeof(((decoded_msg_t *)0)->text)];
 static spectrum_msg_t s_audio_spectrum_msg;
+
+static void handle_ui_event(const ui_event_t *event);
 
 static int32_t calc_block_rms(const int16_t *samples, size_t count)
 {
@@ -232,6 +235,7 @@ static void ui_task(void *arg)
         }
 
         const ui_event_t event = ui_poll(&display_state);
+        handle_ui_event(&event);
         switch (event.type) {
         case UI_EVENT_MODE_CHANGED:
             display_state.selected_mode = event.mode;
@@ -265,6 +269,8 @@ static void ui_task(void *arg)
             display_state.rx_tone_hz = event.tone_hz;
             (void)xQueueSend(s_control_queue, &event, 0);
             break;
+        case UI_EVENT_TX_REQUEST:
+            break;
         case UI_EVENT_NONE:
         default:
             break;
@@ -283,21 +289,35 @@ static void ui_task(void *arg)
     }
 }
 
+static void handle_ui_event(const ui_event_t *event)
+{
+    switch (event->type) {
+    case UI_EVENT_TX_REQUEST:
+        (void)tx_submit(&event->tx_request);
+        break;
+    default:
+        break;
+    }
+}
+
 void app_main(void)
 {
     ESP_ERROR_CHECK(display_init());
     ESP_ERROR_CHECK(ui_init());
     ESP_ERROR_CHECK(transport_init(TRANSPORT_MODE_USB_SERIAL));
     ESP_ERROR_CHECK(audio_input_init());
+    ESP_ERROR_CHECK(tx_init());
 
     s_decoded_queue = xQueueCreate(8, sizeof(decoded_msg_t));
     s_control_queue = xQueueCreate(4, sizeof(ui_event_t));
     s_spectrum_queue = xQueueCreate(1, sizeof(spectrum_msg_t));
     ESP_ERROR_CHECK(s_decoded_queue && s_control_queue && s_spectrum_queue ? ESP_OK : ESP_ERR_NO_MEM);
 
-    BaseType_t task_ok = xTaskCreate(audio_task, "psk_audio", 16384, NULL, 8, NULL);
+    BaseType_t task_ok = xTaskCreatePinnedToCore(audio_task, "psk_audio", 16384, NULL, 8, NULL, 1);
     ESP_ERROR_CHECK(task_ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
-    task_ok = xTaskCreate(ui_task, "psk_ui", 6144, NULL, 2, NULL);
+    task_ok = xTaskCreatePinnedToCore(ui_task, "psk_ui", 6144, NULL, 2, NULL, 0);
+    ESP_ERROR_CHECK(task_ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    task_ok = xTaskCreatePinnedToCore(tx_task, "psk_tx", 12288, NULL, 7, NULL, 1);
     ESP_ERROR_CHECK(task_ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 
     ESP_LOGI(TAG, "ESP32-P4 PSK modem started");
