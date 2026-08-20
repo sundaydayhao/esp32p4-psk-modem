@@ -16,8 +16,11 @@
 
 static const char *TAG = "audio";
 static esp_codec_dev_handle_t s_mic_dev;
+static esp_codec_dev_handle_t s_spk_dev;
 static audio_decim_state_t s_decim_state;
 static int16_t s_raw_samples[1536];
+static uint8_t s_dac_volume = 70;
+static uint8_t s_headphone_volume = 70;
 
 #define AUDIO_INPUT_CAPTURE_MAX_SAMPLES 32768U
 static int16_t s_capture[AUDIO_INPUT_CAPTURE_MAX_SAMPLES] EXT_RAM_BSS_ATTR;
@@ -69,6 +72,8 @@ esp_err_t audio_input_init(void)
 
     s_mic_dev = bsp_audio_codec_microphone_init();
     ESP_RETURN_ON_FALSE(s_mic_dev, ESP_ERR_NO_MEM, TAG, "microphone codec init");
+    s_spk_dev = bsp_audio_codec_speaker_init();
+    ESP_RETURN_ON_FALSE(s_spk_dev, ESP_ERR_NO_MEM, TAG, "speaker codec init");
 
     esp_codec_dev_sample_info_t fs = {
         .bits_per_sample = 16,
@@ -79,8 +84,14 @@ esp_err_t audio_input_init(void)
     };
     ESP_RETURN_ON_FALSE(esp_codec_dev_open(s_mic_dev, &fs) == ESP_CODEC_DEV_OK,
                         ESP_FAIL, TAG, "open microphone codec");
+    ESP_RETURN_ON_FALSE(esp_codec_dev_open(s_spk_dev, &fs) == ESP_CODEC_DEV_OK,
+                        ESP_FAIL, TAG, "open speaker codec");
+    ESP_RETURN_ON_FALSE(esp_codec_dev_set_out_vol(s_spk_dev, s_headphone_volume) == ESP_CODEC_DEV_OK,
+                        ESP_FAIL, TAG, "set speaker volume");
+    ESP_RETURN_ON_FALSE(esp_codec_dev_set_out_mute(s_spk_dev, false) == ESP_CODEC_DEV_OK,
+                        ESP_FAIL, TAG, "unmute speaker");
 
-    ESP_LOGI(TAG, "ESP32-P4 BSP microphone ready: codec %d Hz, modem %d Hz",
+    ESP_LOGI(TAG, "ESP32-P4 BSP audio ready: codec %d Hz, modem %d Hz",
              BOARD_CODEC_SAMPLE_RATE_HZ, BOARD_MODEM_SAMPLE_RATE_HZ);
     return ESP_OK;
 }
@@ -144,6 +155,40 @@ size_t audio_input_read(int16_t *samples, size_t max_samples, uint32_t timeout_m
 #endif
 
     return out_count;
+}
+
+size_t audio_output_write(const int16_t *samples, size_t count)
+{
+    if (!samples || count == 0 || !s_spk_dev) {
+        return 0;
+    }
+
+    const int bytes = (int)(count * sizeof(samples[0]));
+    return esp_codec_dev_write(s_spk_dev, (void *)samples, bytes) == ESP_CODEC_DEV_OK ? count : 0;
+}
+
+size_t audio_output_queued(void)
+{
+    return 0;
+}
+
+size_t audio_output_capacity(void)
+{
+    return 4096;
+}
+
+void audio_output_clear(void)
+{
+}
+
+esp_err_t audio_output_set_codec_gain(uint8_t dac_volume, uint8_t headphone_volume)
+{
+    s_dac_volume = dac_volume;
+    s_headphone_volume = headphone_volume > 100 ? 100 : headphone_volume;
+    if (!s_spk_dev) {
+        return ESP_OK;
+    }
+    return esp_codec_dev_set_out_vol(s_spk_dev, s_headphone_volume) == ESP_CODEC_DEV_OK ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t audio_input_capture_start(size_t max_samples)

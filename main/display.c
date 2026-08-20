@@ -225,23 +225,28 @@ void display_render(const display_state_t *state, const spectrum_t *spectrum)
         return;
     }
 
-    s_band_min_hz = modem_mode_band_min_hz(state->selected_mode);
-    s_band_max_hz = modem_mode_band_max_hz(state->selected_mode);
+    const int tx_role = state->display_role != 0;
+    s_band_min_hz = tx_role ? 100 : modem_mode_band_min_hz(state->selected_mode);
+    s_band_max_hz = tx_role ? 3500 : modem_mode_band_max_hz(state->selected_mode);
 
     if (bsp_display_lock(0)) {
         waterfall_render_row(s_canvas_buf, spectrum);
         lv_obj_invalidate(s_spectrum);
-        update_tone_marker(state->rx_tone_hz);
+        update_tone_marker(tx_role ? state->tx_tone_hz : state->rx_tone_hz);
 
-        char status[96];
-        const char *mode_name = demod_profile_for_mode(state->selected_mode)->family == DEMOD_FAMILY_PSK ?
-                                psk_mode_name(state->selected_psk_mode) :
-                                modem_mode_name(state->selected_mode);
-        snprintf(status, sizeof(status), "%s %s RX %d Hz Peak %d Hz",
+        char status[128];
+        const char *mode_name = tx_role ?
+                                psk_mode_name(state->selected_tx_psk_mode) :
+                                (demod_profile_for_mode(state->selected_mode)->family == DEMOD_FAMILY_PSK ?
+                                 psk_mode_name(state->selected_psk_mode) :
+                                 modem_mode_name(state->selected_mode));
+        snprintf(status, sizeof(status), "%s %s %s %d Hz Peak %d Hz TX %d/%u",
                  mode_name, transport_mode_name(state->transport_mode),
-                 state->rx_tone_hz, spectrum->peak_hz);
+                 tx_role ? "TX" : "RX",
+                 tx_role ? state->tx_tone_hz : state->rx_tone_hz,
+                 spectrum->peak_hz, state->tx_active, (unsigned)state->tx_queued);
         lv_label_set_text(s_status, status);
-        lv_label_set_text(s_text, state->text);
+        lv_label_set_text(s_text, tx_role ? state->tx_text : state->text);
         lv_obj_update_layout(s_text_view);
         lv_obj_scroll_to_y(s_text_view, LV_COORD_MAX, LV_ANIM_OFF);
         bsp_display_unlock();

@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "audio_input.h"
 #include "board_config.h"
@@ -14,7 +15,7 @@
 
 static const char *TAG = "ui";
 static int s_last_sw1 = 1;
-static char s_serial_cmd[32];
+static char s_serial_cmd[320];
 static size_t s_serial_cmd_len;
 static int s_dump_pending;
 
@@ -127,7 +128,29 @@ static int cmd_starts(const char *text, const char *keyword)
         text++;
         keyword++;
     }
-    return *text == '\0' || *text == ' ' || *text == '\t';
+    return *text == '\0' || *text == ' ' || *text == '\t' || *text == '=' || *text == ':';
+}
+
+static const char *skip_command_arg(const char *text, const char *keyword)
+{
+    text += strlen(keyword);
+    text = skip_spaces(text);
+    if (*text == '=' || *text == ':') {
+        text++;
+    }
+    return skip_spaces(text);
+}
+
+static int parse_psk_mode_name(const char *name, psk_mode_t *mode)
+{
+    for (size_t i = 0; i < psk_mode_count(); ++i) {
+        const psk_mode_info_t *info = psk_mode_info_at(i);
+        if (info && cmd_equals(name, info->name)) {
+            *mode = info->id;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void print_capture_dump(void)
@@ -193,27 +216,15 @@ static int parse_serial_mode_command(const char *cmd, ui_event_t *event)
     while (*cmd == ' ' || *cmd == '\t') {
         cmd++;
     }
-    if ((toupper((unsigned char)cmd[0]) == 'M') &&
-        (toupper((unsigned char)cmd[1]) == 'O') &&
-        (toupper((unsigned char)cmd[2]) == 'D') &&
-        (toupper((unsigned char)cmd[3]) == 'E') &&
-        (cmd[4] == ' ' || cmd[4] == '\t')) {
-        cmd += 5;
-        while (*cmd == ' ' || *cmd == '\t') {
-            cmd++;
-        }
+    if (cmd_starts(cmd, "MODE")) {
+        cmd = skip_command_arg(cmd, "MODE");
     }
 
-    for (size_t i = 0; i < psk_mode_count(); ++i) {
-        const psk_mode_info_t *info = psk_mode_info_at(i);
-        if (!info) {
-            continue;
-        }
-        if (cmd_equals(cmd, info->name)) {
-            event->type = UI_EVENT_PSK_MODE_CHANGED;
-            event->psk_mode = info->id;
-            return 1;
-        }
+    psk_mode_t psk_mode;
+    if (parse_psk_mode_name(cmd, &psk_mode)) {
+        event->type = UI_EVENT_PSK_MODE_CHANGED;
+        event->psk_mode = psk_mode;
+        return 1;
     }
 
     if (cmd_equals(cmd, "FT8")) {
@@ -245,7 +256,88 @@ static int parse_serial_mode_command(const char *cmd, ui_event_t *event)
     return 0;
 }
 
-static ui_event_t poll_serial_command(void)
+static int parse_serial_control_command(const char *cmd, const display_state_t *display_state,
+                                        ui_event_t *event)
+{
+    while (*cmd == ' ' || *cmd == '\t') {
+        cmd++;
+    }
+    if (*cmd == '@') {
+        cmd++;
+    }
+    cmd = skip_spaces(cmd);
+
+    if (cmd_starts(cmd, "ROLE")) {
+        const char *arg = skip_command_arg(cmd, "ROLE");
+        if (cmd_equals(arg, "TX")) {
+            event->type = UI_EVENT_DISPLAY_ROLE_CHANGED;
+            event->display_role = 1;
+            return 1;
+        }
+        if (cmd_equals(arg, "RX")) {
+            event->type = UI_EVENT_DISPLAY_ROLE_CHANGED;
+            event->display_role = 0;
+            return 1;
+        }
+        printf("[cmd] error role must be TX or RX\r\n");
+        return 1;
+    }
+
+    if (cmd_starts(cmd, "TXMODE")) {
+        const char *arg = skip_command_arg(cmd, "TXMODE");
+        psk_mode_t mode;
+        if (parse_psk_mode_name(arg, &mode)) {
+            event->type = UI_EVENT_TX_MODE_CHANGED;
+            event->tx_psk_mode = mode;
+            return 1;
+        }
+        printf("[cmd] error unknown tx mode '%s'\r\n", arg);
+        return 1;
+    }
+
+    if (cmd_starts(cmd, "TX")) {
+        const char *arg = skip_command_arg(cmd, "TX");
+        const char *text = *arg ? arg : "THE QUICK BROWN FOX 0123456789\r\n";
+        event->type = UI_EVENT_TX_TEXT;
+        event->tx_psk_mode = display_state->selected_tx_psk_mode;
+        event->tx_tone_hz = display_state->tx_tone_hz > 0 ? display_state->tx_tone_hz : 1500;
+        strncpy(event->tx_text, text, sizeof(event->tx_text) - 1);
+        event->tx_text[sizeof(event->tx_text) - 1] = '\0';
+        return 1;
+    }
+
+    if (cmd_starts(cmd, "OUTVOL")) {
+        const char *arg = skip_command_arg(cmd, "OUTVOL");
+        char *end = NULL;
+        const long dac = strtol(arg, &end, 0);
+        const long hp = strtol(skip_spaces(end), NULL, 0);
+        if (end == arg || dac < 0 || dac > 255 || hp < 0 || hp > 127) {
+            printf("[cmd] error output volume must be: OUTVOL <dac 0..255> <hp 0..127>\r\n");
+            return 1;
+        }
+        event->type = UI_EVENT_OUTPUT_GAIN;
+        event->output_dac_volume = (int)dac;
+        event->output_hp_volume = (int)hp;
+        return 1;
+    }
+
+    if (cmd_starts(cmd, "STATUS")) {
+        printf("[status] role=%s rxmode=%s psk=%s txmode=%s tone=%dHz txtone=%dHz tx=%d/%u\r\n",
+               display_state->display_role ? "TX" : "RX",
+               modem_mode_name(display_state->selected_mode),
+               psk_mode_name(display_state->selected_psk_mode),
+               psk_mode_name(display_state->selected_tx_psk_mode),
+               display_state->rx_tone_hz,
+               display_state->tx_tone_hz,
+               display_state->tx_active,
+               (unsigned)display_state->tx_queued);
+        return 1;
+    }
+
+    return 0;
+}
+
+static ui_event_t poll_serial_command(const display_state_t *display_state)
 {
     ui_event_t event = { .type = UI_EVENT_NONE };
     uint8_t data[32];
@@ -261,14 +353,15 @@ static ui_event_t poll_serial_command(void)
             if (ch == '\r' || ch == '\n') {
                 if (s_serial_cmd_len > 0) {
                     s_serial_cmd[s_serial_cmd_len] = '\0';
-                    if (s_serial_cmd[0] == '@') {
-                        if (handle_capture_command(s_serial_cmd + 1)) {
-                            ESP_LOGI(TAG, "serial capture command: %s", s_serial_cmd);
-                        } else if (parse_serial_mode_command(s_serial_cmd, &event)) {
-                            ESP_LOGI(TAG, "serial mode command: %s", s_serial_cmd);
-                        } else {
-                            ESP_LOGW(TAG, "unknown serial mode command: %s", s_serial_cmd);
-                        }
+                    const char *cmd = s_serial_cmd[0] == '@' ? s_serial_cmd + 1 : s_serial_cmd;
+                    if (handle_capture_command(cmd)) {
+                        ESP_LOGI(TAG, "serial capture command: %s", s_serial_cmd);
+                    } else if (parse_serial_control_command(s_serial_cmd, display_state, &event)) {
+                        ESP_LOGI(TAG, "serial control command: %s", s_serial_cmd);
+                    } else if (parse_serial_mode_command(s_serial_cmd, &event)) {
+                        ESP_LOGI(TAG, "serial mode command: %s", s_serial_cmd);
+                    } else {
+                        ESP_LOGW(TAG, "unknown serial command: %s", s_serial_cmd);
                     }
                     s_serial_cmd_len = 0;
                     if (event.type != UI_EVENT_NONE) {
@@ -312,7 +405,7 @@ ui_event_t ui_poll(const display_state_t *display_state)
     display_task_handler();
     finish_pending_capture_dump();
 
-    event = poll_serial_command();
+    event = poll_serial_command(display_state);
     if (event.type != UI_EVENT_NONE) {
         return event;
     }

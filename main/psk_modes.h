@@ -54,6 +54,12 @@ typedef struct {
     uint8_t punctured;
     uint8_t decode_supported;
     psk_rtty_mode_t backend_mode;
+    uint8_t fec_k;
+    uint32_t fec_poly1;
+    uint32_t fec_poly2;
+    uint16_t interleave_depth;
+    uint8_t dual_fec_branch;
+    uint8_t mfsk_varicode;
 } psk_mode_info_t;
 
 const psk_mode_info_t *psk_mode_info(psk_mode_t mode);

@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "audio_decim.h"
 #include "audio_input.h"
 #include "board_config.h"
 #include "display.h"
@@ -13,6 +14,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "modem.h"
+#include "psk_tx.h"
 #include "spectrum.h"
 #include "transport.h"
 #include "ui.h"
@@ -30,13 +32,34 @@ typedef struct {
     size_t count;
 } spectrum_msg_t;
 
+typedef enum {
+    TX_CMD_SET_MODE,
+    TX_CMD_START_TEXT,
+    TX_CMD_SET_OUTPUT_GAIN,
+} tx_cmd_type_t;
+
+typedef struct {
+    tx_cmd_type_t type;
+    psk_mode_t mode;
+    int tone_hz;
+    int dac_volume;
+    int hp_volume;
+    char text[256];
+} tx_cmd_t;
+
 static QueueHandle_t s_decoded_queue;
 static QueueHandle_t s_control_queue;
 static QueueHandle_t s_spectrum_queue;
+static QueueHandle_t s_tx_queue;
 static modem_t s_audio_modem;
 static int16_t s_audio_samples[256];
 static char s_audio_decoded[sizeof(((decoded_msg_t *)0)->text)];
 static spectrum_msg_t s_audio_spectrum_msg;
+static volatile int s_display_role;
+static volatile int s_tx_active;
+static volatile size_t s_tx_queued;
+
+#define PSK_TX_CHUNK_SAMPLES 256U
 
 static int32_t calc_block_rms(const int16_t *samples, size_t count)
 {
@@ -84,9 +107,97 @@ static void apply_control_event(modem_t *modem, const ui_event_t *event)
     case UI_EVENT_TONE_CHANGED:
         modem_set_rx_tone(modem, event->tone_hz);
         break;
+    case UI_EVENT_TX_MODE_CHANGED:
+    case UI_EVENT_DISPLAY_ROLE_CHANGED:
+    case UI_EVENT_TX_TEXT:
+    case UI_EVENT_OUTPUT_GAIN:
     case UI_EVENT_NONE:
     default:
         break;
+    }
+}
+
+static void send_tx_cmd(const tx_cmd_t *cmd)
+{
+    if (s_tx_queue && cmd) {
+        (void)xQueueSend(s_tx_queue, cmd, 0);
+    }
+}
+
+static void tx_task(void *arg)
+{
+    (void)arg;
+
+    psk_tx_t tx;
+    psk_tx_init(&tx, BOARD_CODEC_SAMPLE_RATE_HZ);
+    audio_decim_state_t preview_decim;
+    audio_decim_init(&preview_decim);
+    psk_mode_t tx_mode = PSK_MODE_BPSK31;
+    int tx_tone_hz = 1500;
+
+    int16_t samples[PSK_TX_CHUNK_SAMPLES];
+    int16_t preview[(PSK_TX_CHUNK_SAMPLES / (BOARD_CODEC_SAMPLE_RATE_HZ / BOARD_MODEM_SAMPLE_RATE_HZ)) + 8U];
+
+    ESP_LOGI(TAG, "tx task started");
+
+    while (true) {
+        tx_cmd_t cmd;
+        while (xQueueReceive(s_tx_queue, &cmd, 0) == pdTRUE) {
+            switch (cmd.type) {
+            case TX_CMD_SET_MODE:
+                tx_mode = cmd.mode;
+                break;
+            case TX_CMD_SET_OUTPUT_GAIN:
+                (void)audio_output_set_codec_gain((uint8_t)cmd.dac_volume, (uint8_t)cmd.hp_volume);
+                break;
+            case TX_CMD_START_TEXT:
+                tx_mode = cmd.mode;
+                tx_tone_hz = cmd.tone_hz > 0 ? cmd.tone_hz : 1500;
+                audio_output_clear();
+                audio_decim_init(&preview_decim);
+                if (psk_tx_start_text(&tx, tx_mode, tx_tone_hz, cmd.text) == 0) {
+                    s_tx_active = 1;
+                    ESP_LOGI(TAG, "tx start mode=%s tone=%d text='%s'",
+                             psk_mode_name(tx_mode), tx_tone_hz, cmd.text);
+                } else {
+                    s_tx_active = 0;
+                    ESP_LOGW(TAG, "tx start failed mode=%s text_len=%u",
+                             psk_mode_name(tx_mode), (unsigned)strlen(cmd.text));
+                }
+                break;
+            default:
+                break;
+            }
+        }
+
+        if (psk_tx_active(&tx)) {
+            const size_t generated = psk_tx_generate(&tx, samples,
+                                                     sizeof(samples) / sizeof(samples[0]));
+            if (generated > 0) {
+                const size_t written = audio_output_write(samples, generated);
+                s_tx_queued = audio_output_queued();
+                if (s_display_role) {
+                    spectrum_msg_t msg = {0};
+                    msg.count = audio_decim_process(&preview_decim, samples, generated,
+                                                    preview,
+                                                    BOARD_CODEC_SAMPLE_RATE_HZ / BOARD_MODEM_SAMPLE_RATE_HZ);
+                    if (msg.count > SPECTRUM_MAX_SAMPLES) {
+                        msg.count = SPECTRUM_MAX_SAMPLES;
+                    }
+                    memcpy(msg.samples, preview, msg.count * sizeof(msg.samples[0]));
+                    (void)xQueueOverwrite(s_spectrum_queue, &msg);
+                }
+                if (written == 0) {
+                    vTaskDelay(pdMS_TO_TICKS(2));
+                }
+            }
+        } else {
+            s_tx_active = 0;
+            s_tx_queued = audio_output_queued();
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
@@ -130,10 +241,12 @@ static void audio_task(void *arg)
             reads_this_second++;
             samples_this_second += count;
 
-            s_audio_spectrum_msg.count = count > SPECTRUM_MAX_SAMPLES ? SPECTRUM_MAX_SAMPLES : count;
-            memcpy(s_audio_spectrum_msg.samples, s_audio_samples,
-                   s_audio_spectrum_msg.count * sizeof(s_audio_spectrum_msg.samples[0]));
-            (void)xQueueOverwrite(s_spectrum_queue, &s_audio_spectrum_msg);
+            if (!s_display_role) {
+                s_audio_spectrum_msg.count = count > SPECTRUM_MAX_SAMPLES ? SPECTRUM_MAX_SAMPLES : count;
+                memcpy(s_audio_spectrum_msg.samples, s_audio_samples,
+                       s_audio_spectrum_msg.count * sizeof(s_audio_spectrum_msg.samples[0]));
+                (void)xQueueOverwrite(s_spectrum_queue, &s_audio_spectrum_msg);
+            }
 
             last_rms = calc_block_rms(s_audio_samples, count);
             last_active = last_rms >= BOARD_AUDIO_ACTIVE_RMS_MIN;
@@ -217,8 +330,12 @@ static void ui_task(void *arg)
     display_state_t display_state = {
         .selected_mode = MODEM_MODE_PSK63,
         .selected_psk_mode = PSK_MODE_BPSK63,
+        .selected_tx_psk_mode = PSK_MODE_BPSK31,
         .transport_mode = TRANSPORT_MODE_USB_SERIAL,
         .rx_tone_hz = 1500,
+        .tx_tone_hz = 1500,
+        .display_role = 0,
+        .tx_text = "THE QUICK BROWN FOX 0123456789\r\n",
     };
     spectrum_t spectrum = {0};
     int64_t last_render_us = 0;
@@ -265,6 +382,46 @@ static void ui_task(void *arg)
             display_state.rx_tone_hz = event.tone_hz;
             (void)xQueueSend(s_control_queue, &event, 0);
             break;
+        case UI_EVENT_TX_MODE_CHANGED: {
+            display_state.selected_tx_psk_mode = event.tx_psk_mode;
+            tx_cmd_t cmd = {
+                .type = TX_CMD_SET_MODE,
+                .mode = event.tx_psk_mode,
+            };
+            send_tx_cmd(&cmd);
+            break;
+        }
+        case UI_EVENT_DISPLAY_ROLE_CHANGED:
+            display_state.display_role = event.display_role != 0;
+            s_display_role = display_state.display_role;
+            break;
+        case UI_EVENT_TX_TEXT: {
+            display_state.display_role = 1;
+            s_display_role = 1;
+            display_state.selected_tx_psk_mode = event.tx_psk_mode;
+            display_state.tx_tone_hz = event.tx_tone_hz > 0 ? event.tx_tone_hz : 1500;
+            strncpy(display_state.tx_text, event.tx_text, sizeof(display_state.tx_text) - 1);
+            display_state.tx_text[sizeof(display_state.tx_text) - 1] = '\0';
+            tx_cmd_t cmd = {
+                .type = TX_CMD_START_TEXT,
+                .mode = event.tx_psk_mode,
+                .tone_hz = display_state.tx_tone_hz,
+            };
+            size_t text_len = strnlen(display_state.tx_text, sizeof(cmd.text) - 1);
+            memcpy(cmd.text, display_state.tx_text, text_len);
+            cmd.text[text_len] = '\0';
+            send_tx_cmd(&cmd);
+            break;
+        }
+        case UI_EVENT_OUTPUT_GAIN: {
+            tx_cmd_t cmd = {
+                .type = TX_CMD_SET_OUTPUT_GAIN,
+                .dac_volume = event.output_dac_volume,
+                .hp_volume = event.output_hp_volume,
+            };
+            send_tx_cmd(&cmd);
+            break;
+        }
         case UI_EVENT_NONE:
         default:
             break;
@@ -273,6 +430,8 @@ static void ui_task(void *arg)
         const int64_t now_us = esp_timer_get_time();
         if (now_us - last_render_us >= 100000) {
             last_render_us = now_us;
+            display_state.tx_active = s_tx_active;
+            display_state.tx_queued = s_tx_queued;
             spectrum_msg_t spectrum_msg;
             if (xQueueReceive(s_spectrum_queue, &spectrum_msg, 0) == pdTRUE) {
                 spectrum_analyze(spectrum_msg.samples, spectrum_msg.count, BOARD_MODEM_SAMPLE_RATE_HZ, &spectrum);
@@ -293,11 +452,15 @@ void app_main(void)
     s_decoded_queue = xQueueCreate(8, sizeof(decoded_msg_t));
     s_control_queue = xQueueCreate(4, sizeof(ui_event_t));
     s_spectrum_queue = xQueueCreate(1, sizeof(spectrum_msg_t));
-    ESP_ERROR_CHECK(s_decoded_queue && s_control_queue && s_spectrum_queue ? ESP_OK : ESP_ERR_NO_MEM);
+    s_tx_queue = xQueueCreate(4, sizeof(tx_cmd_t));
+    ESP_ERROR_CHECK(s_decoded_queue && s_control_queue && s_spectrum_queue && s_tx_queue ?
+                    ESP_OK : ESP_ERR_NO_MEM);
 
-    BaseType_t task_ok = xTaskCreate(audio_task, "psk_audio", 16384, NULL, 8, NULL);
+    BaseType_t task_ok = xTaskCreatePinnedToCore(audio_task, "psk_audio", 16384, NULL, 8, NULL, 0);
     ESP_ERROR_CHECK(task_ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
-    task_ok = xTaskCreate(ui_task, "psk_ui", 6144, NULL, 2, NULL);
+    task_ok = xTaskCreatePinnedToCore(tx_task, "psk_tx", 8192, NULL, 7, NULL, 0);
+    ESP_ERROR_CHECK(task_ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    task_ok = xTaskCreatePinnedToCore(ui_task, "psk_ui", 6144, NULL, 2, NULL, 1);
     ESP_ERROR_CHECK(task_ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 
     ESP_LOGI(TAG, "ESP32-P4 PSK modem started");

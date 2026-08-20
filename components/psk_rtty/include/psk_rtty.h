@@ -76,6 +76,8 @@ typedef struct {
     float dev_ave;
     float bpsk_average_amp;
     float psk8_last_phase_quality;
+    float psk8_coarse_freq;
+    psk_rtty_complex_t psk8_eighth_prev;
     float bit_phase_inc;
     float bit_phase_pos;
     int second_decim;
@@ -112,6 +114,7 @@ typedef struct {
     float carrier_i_prev[12];
     float carrier_q_prev[12];
     uint8_t carrier_has_prev[12];
+    uint8_t psk8_eighth_valid;
     uint8_t carriers;
     uint8_t bits_per_symbol;
     uint8_t psk_family;
@@ -152,6 +155,8 @@ typedef struct {
     int sample_count;
     int afc_timer;
     int afc_enabled;
+    int timing_bins;
+    int timing_half_pos;
     int pk_pos;
     int new_pk_pos;
     int raw_pk_pos;
@@ -182,6 +187,9 @@ typedef struct {
     uint32_t debug_delims;
     uint32_t debug_chars;
     uint32_t debug_unknown;
+    uint32_t debug_timing_adjusts;
+    uint32_t debug_soft_ambiguous;
+    uint32_t debug_coarse_updates;
     int debug_fec_metric[2];
     uint8_t debug_fec_selected;
 } psk_rtty_rx_t;
