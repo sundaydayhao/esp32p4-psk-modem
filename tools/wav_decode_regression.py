@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Offline WAV regression for the ESP32-S3 PSK modem mode table.
+"""Offline WAV regression for the ESP32-P4 PSK modem mode table.
 
-The test reads every WAV in C:\\projects\\psk-script\\generated-wav and checks
-whether PSK modes in main/modem.c can recover a
-recognizable fragment from C:\\projects\\psk-script\\input.txt.
+The test reads every WAV in C:\\projects\\psk-script\\generated-wav-48000 and
+checks whether PSK modes in main/psk_modes.c can recover a recognizable
+fragment from C:\\projects\\psk-script\\input.txt.
 
 This is intentionally a host-side smoke test. It uses the same PSK varicode
 table and the same non-FEC single-carrier BPSK bit polarity as the firmware:
@@ -23,8 +23,8 @@ from pathlib import Path
 import numpy as np
 
 
-DEFAULT_PROJECT = Path(r"C:\projects\esp32s3-psk-modem")
-DEFAULT_WAV_DIR = Path(r"C:\projects\psk-script\generated-wav")
+DEFAULT_PROJECT = Path(r"C:\projects\esp32p4-psk-modem")
+DEFAULT_WAV_DIR = Path(r"C:\projects\psk-script\generated-wav-48000")
 DEFAULT_INPUT = Path(r"C:\projects\psk-script\input.txt")
 DEFAULT_TONE_HZ = 1500.0
 PUNCTURE = None
@@ -52,7 +52,7 @@ def parse_float_expr(expr: str) -> float:
 
 
 def load_modes(project: Path) -> dict[str, ModeInfo]:
-    (project / "main" / "modem.c").read_text(encoding="utf-8")
+    (project / "main" / "psk_modes.c").read_text(encoding="utf-8")
 
     def m(name: str, family: str, baud: float, symbits: int, carriers: int,
           fec: bool = False, punctured: bool = False) -> ModeInfo:

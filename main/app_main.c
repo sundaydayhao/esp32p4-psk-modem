@@ -11,6 +11,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "rx_modem.h"
 #include "spectrum.h"
@@ -34,12 +35,20 @@ typedef struct {
 static QueueHandle_t s_decoded_queue;
 static QueueHandle_t s_control_queue;
 static QueueHandle_t s_spectrum_queue;
+static SemaphoreHandle_t s_ui_state_mutex;
 static modem_t s_audio_modem;
 static int16_t s_audio_samples[256];
 static char s_audio_decoded[sizeof(((decoded_msg_t *)0)->text)];
 static spectrum_msg_t s_audio_spectrum_msg;
+static display_state_t *s_ui_display_state;
 
 static void handle_ui_event(const ui_event_t *event);
+static void display_mode_selected(psk_mode_t mode, void *user);
+static void display_role_selected(display_role_t role, void *user);
+static void display_tx_text_selected(uint8_t index, void *user);
+static void sync_ui_selected_mode(psk_mode_t mode);
+static void sync_ui_selected_role(display_role_t role);
+static void copy_ui_state(display_state_t *dst, const display_state_t *src);
 
 static int32_t calc_block_rms(const int16_t *samples, size_t count)
 {
@@ -227,15 +236,39 @@ static void ui_task(void *arg)
     int64_t last_render_us = 0;
 
     ESP_LOGI(TAG, "ui task started");
+    if (s_ui_state_mutex) {
+        xSemaphoreTake(s_ui_state_mutex, portMAX_DELAY);
+        s_ui_display_state = &display_state;
+        xSemaphoreGive(s_ui_state_mutex);
+    } else {
+        s_ui_display_state = &display_state;
+    }
 
     while (true) {
         decoded_msg_t msg;
         while (xQueueReceive(s_decoded_queue, &msg, 0) == pdTRUE) {
+            if (s_ui_state_mutex) {
+                xSemaphoreTake(s_ui_state_mutex, portMAX_DELAY);
+            }
             display_append_text(&display_state, msg.text);
+            if (s_ui_state_mutex) {
+                xSemaphoreGive(s_ui_state_mutex);
+            }
         }
 
-        const ui_event_t event = ui_poll(&display_state);
+        if (s_ui_state_mutex) {
+            xSemaphoreTake(s_ui_state_mutex, portMAX_DELAY);
+        }
+        display_state_t ui_state_snapshot = display_state;
+        if (s_ui_state_mutex) {
+            xSemaphoreGive(s_ui_state_mutex);
+        }
+
+        const ui_event_t event = ui_poll(&ui_state_snapshot);
         handle_ui_event(&event);
+        if (s_ui_state_mutex) {
+            xSemaphoreTake(s_ui_state_mutex, portMAX_DELAY);
+        }
         switch (event.type) {
         case UI_EVENT_MODE_CHANGED:
             display_state.selected_mode = event.mode;
@@ -275,6 +308,9 @@ static void ui_task(void *arg)
         default:
             break;
         }
+        if (s_ui_state_mutex) {
+            xSemaphoreGive(s_ui_state_mutex);
+        }
 
         const int64_t now_us = esp_timer_get_time();
         if (now_us - last_render_us >= 100000) {
@@ -283,7 +319,14 @@ static void ui_task(void *arg)
             if (xQueueReceive(s_spectrum_queue, &spectrum_msg, 0) == pdTRUE) {
                 spectrum_analyze(spectrum_msg.samples, spectrum_msg.count, BOARD_MODEM_SAMPLE_RATE_HZ, &spectrum);
             }
-            display_render(&display_state, &spectrum);
+            if (s_ui_state_mutex) {
+                xSemaphoreTake(s_ui_state_mutex, portMAX_DELAY);
+                copy_ui_state(&ui_state_snapshot, &display_state);
+                xSemaphoreGive(s_ui_state_mutex);
+                display_render(&ui_state_snapshot, &spectrum);
+            } else {
+                display_render(&display_state, &spectrum);
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(20));
     }
@@ -300,9 +343,67 @@ static void handle_ui_event(const ui_event_t *event)
     }
 }
 
+static void sync_ui_selected_mode(psk_mode_t mode)
+{
+    if (!s_ui_display_state || !s_ui_state_mutex) {
+        return;
+    }
+    xSemaphoreTake(s_ui_state_mutex, portMAX_DELAY);
+    s_ui_display_state->selected_psk_mode = mode;
+    s_ui_display_state->selected_mode = mode == PSK_MODE_BPSK31 ?
+        MODEM_MODE_BPSK31 : MODEM_MODE_PSK63;
+    xSemaphoreGive(s_ui_state_mutex);
+}
+
+static void sync_ui_selected_role(display_role_t role)
+{
+    if (!s_ui_display_state || !s_ui_state_mutex) {
+        return;
+    }
+    xSemaphoreTake(s_ui_state_mutex, portMAX_DELAY);
+    s_ui_display_state->display_role = role;
+    xSemaphoreGive(s_ui_state_mutex);
+}
+
+static void copy_ui_state(display_state_t *dst, const display_state_t *src)
+{
+    if (!dst || !src) {
+        return;
+    }
+    *dst = *src;
+}
+
+static void display_mode_selected(psk_mode_t mode, void *user)
+{
+    (void)user;
+    sync_ui_selected_mode(mode);
+    ui_event_t event = {
+        .type = UI_EVENT_PSK_MODE_CHANGED,
+        .psk_mode = mode,
+    };
+    (void)xQueueSend(s_control_queue, &event, 0);
+}
+
+static void display_role_selected(display_role_t role, void *user)
+{
+    (void)user;
+    sync_ui_selected_role(role);
+}
+
+static void display_tx_text_selected(uint8_t index, void *user)
+{
+    (void)index;
+    (void)user;
+}
+
 void app_main(void)
 {
+    s_ui_state_mutex = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(s_ui_state_mutex ? ESP_OK : ESP_ERR_NO_MEM);
     ESP_ERROR_CHECK(display_init());
+    display_set_mode_selected_callback(display_mode_selected, NULL);
+    display_set_role_selected_callback(display_role_selected, NULL);
+    display_set_tx_text_selected_callback(display_tx_text_selected, NULL);
     ESP_ERROR_CHECK(ui_init());
     ESP_ERROR_CHECK(transport_init(TRANSPORT_MODE_USB_SERIAL));
     ESP_ERROR_CHECK(audio_input_init());

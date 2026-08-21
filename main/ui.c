@@ -340,7 +340,6 @@ esp_err_t ui_init(void)
 ui_event_t ui_poll(const display_state_t *display_state)
 {
     ui_event_t event = { .type = UI_EVENT_NONE };
-    display_task_handler();
     finish_pending_capture_dump();
 
     event = poll_serial_command(display_state);

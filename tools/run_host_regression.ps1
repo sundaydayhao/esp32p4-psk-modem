@@ -3,7 +3,7 @@
 # truth; use multiple corpora when changing symbol mapping or FEC behavior.
 param(
     [string]$Exe = "$PSScriptRoot\..\build\host-tools\host_psk_rtty_wav.exe",
-    [string]$WavDir = "C:\projects\psk-script\generated-wav",
+    [string]$WavDir = "C:\projects\psk-script\generated-wav-48000",
     [string]$Expected = "C:\projects\psk-script\input.txt"
 )
 
