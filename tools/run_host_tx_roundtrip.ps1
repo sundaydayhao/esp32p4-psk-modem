@@ -1,6 +1,6 @@
 param(
     [string]$Exe = "$PSScriptRoot\..\build\host-tools\host_tx_roundtrip.exe",
-    [string]$Text = "THE QUICK BROWN FOX 0123456789 THE QUICK BROWN FOX 0123456789 ESP32P4 PSK MODEM LOOPBACK HOST TEST END"
+    [string]$Text = "One warm and sunny spring morning, Lulu hopped into the green forest to help a tiny bird return to its nest. True bravery is choosing kindness even when you are scared."
 )
 
 $ErrorActionPreference = "Stop"

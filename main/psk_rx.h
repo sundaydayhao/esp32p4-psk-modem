@@ -14,6 +14,7 @@ typedef enum {
     PSK1200F_FRAME_SEARCH = 0,
     PSK1200F_FRAME_HEADER,
     PSK1200F_FRAME_DATA,
+    PSK1200F_FRAME_RESYNC,
 } psk1200f_frame_state_t;
 
 typedef struct {
@@ -27,9 +28,11 @@ typedef struct {
     uint16_t expected_len;
     uint32_t expected_crc;
     uint32_t sequence;
+    uint32_t next_sequence;
     uint32_t valid_frames;
     uint32_t invalid_frames;
     uint32_t sync_events;
+    uint8_t sequence_started;
 } psk1200f_frame_t;
 
 typedef struct {
@@ -85,6 +88,7 @@ typedef struct {
 
 void psk_rx_init(psk_rx_t *m, const psk_rx_config_t *config);
 void psk_rx_reset(psk_rx_t *m);
+void psk_rx_set_sample_rate(psk_rx_t *m, int sample_rate_hz);
 void psk_rx_set_mode(psk_rx_t *m, psk_mode_t mode);
 void psk_rx_set_tone(psk_rx_t *m, int tone_hz);
 void psk_rx_set_afc(psk_rx_t *m, int enabled);

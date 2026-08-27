@@ -1,5 +1,6 @@
 #include "audio_input.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdbool.h>
 #include <string.h>
@@ -22,7 +23,7 @@ static int16_t s_raw_samples[1536];
 static uint8_t s_dac_volume = 70;
 static uint8_t s_headphone_volume = 70;
 
-#define AUDIO_INPUT_CAPTURE_MAX_SAMPLES 32768U
+#define AUDIO_INPUT_CAPTURE_MAX_SAMPLES 131072U
 static int16_t s_capture[AUDIO_INPUT_CAPTURE_MAX_SAMPLES] EXT_RAM_BSS_ATTR;
 static volatile size_t s_capture_limit;
 static volatile size_t s_capture_count;
@@ -75,24 +76,40 @@ esp_err_t audio_input_init(void)
     s_spk_dev = bsp_audio_codec_speaker_init();
     ESP_RETURN_ON_FALSE(s_spk_dev, ESP_ERR_NO_MEM, TAG, "speaker codec init");
 
-    esp_codec_dev_sample_info_t fs = {
+    esp_codec_dev_sample_info_t output_fs = {
         .bits_per_sample = 16,
         .channel = 1,
+        .channel_mask = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0),
+        .sample_rate = BOARD_CODEC_SAMPLE_RATE_HZ,
+        .mclk_multiple = BOARD_AUDIO_MCLK_MULTIPLE,
+    };
+    ESP_RETURN_ON_FALSE(esp_codec_dev_open(s_spk_dev, &output_fs) == ESP_CODEC_DEV_OK,
+                        ESP_FAIL, TAG, "open speaker codec");
+
+    esp_codec_dev_sample_info_t input_fs = {
+        .bits_per_sample = 16,
+        .channel = 2,
         .channel_mask = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(BOARD_AUDIO_INPUT_CHANNEL),
         .sample_rate = BOARD_CODEC_SAMPLE_RATE_HZ,
         .mclk_multiple = BOARD_AUDIO_MCLK_MULTIPLE,
     };
-    ESP_RETURN_ON_FALSE(esp_codec_dev_open(s_mic_dev, &fs) == ESP_CODEC_DEV_OK,
+    ESP_RETURN_ON_FALSE(esp_codec_dev_open(s_mic_dev, &input_fs) == ESP_CODEC_DEV_OK,
                         ESP_FAIL, TAG, "open microphone codec");
-    ESP_RETURN_ON_FALSE(esp_codec_dev_open(s_spk_dev, &fs) == ESP_CODEC_DEV_OK,
-                        ESP_FAIL, TAG, "open speaker codec");
+    int codec_ret = esp_codec_dev_set_in_gain(s_mic_dev, BOARD_AUDIO_INPUT_GAIN_DB);
+    if (codec_ret != ESP_CODEC_DEV_OK) {
+        ESP_LOGW(TAG, "set microphone gain failed: %d", codec_ret);
+    }
+    codec_ret = esp_codec_dev_set_in_mute(s_mic_dev, false);
+    if (codec_ret != ESP_CODEC_DEV_OK) {
+        ESP_LOGW(TAG, "unmute microphone failed: %d", codec_ret);
+    }
     ESP_RETURN_ON_FALSE(esp_codec_dev_set_out_vol(s_spk_dev, s_headphone_volume) == ESP_CODEC_DEV_OK,
                         ESP_FAIL, TAG, "set speaker volume");
     ESP_RETURN_ON_FALSE(esp_codec_dev_set_out_mute(s_spk_dev, false) == ESP_CODEC_DEV_OK,
                         ESP_FAIL, TAG, "unmute speaker");
 
-    ESP_LOGI(TAG, "ESP32-P4 BSP audio ready: codec %d Hz, modem %d Hz",
-             BOARD_CODEC_SAMPLE_RATE_HZ, BOARD_MODEM_SAMPLE_RATE_HZ);
+    ESP_LOGI(TAG, "ESP32-P4 BSP audio ready: codec %d Hz, modem %d Hz, input lane %d",
+             BOARD_CODEC_SAMPLE_RATE_HZ, BOARD_MODEM_SAMPLE_RATE_HZ, BOARD_AUDIO_INPUT_CHANNEL);
     return ESP_OK;
 }
 
@@ -116,13 +133,16 @@ size_t audio_input_read(int16_t *samples, size_t max_samples, uint32_t timeout_m
     const size_t raw_count = max_samples * decim;
     const size_t raw_limit = sizeof(s_raw_samples) / sizeof(s_raw_samples[0]);
     const size_t read_count = raw_count < raw_limit ? raw_count : raw_limit;
-    const int read_bytes = esp_codec_dev_read(s_mic_dev, s_raw_samples,
-                                              (int)(read_count * sizeof(s_raw_samples[0])));
-    if (read_bytes <= 0) {
+    const int read_bytes = (int)(read_count * sizeof(s_raw_samples[0]));
+    const int read_ret = esp_codec_dev_read(s_mic_dev, s_raw_samples, read_bytes);
+    if (read_ret != ESP_CODEC_DEV_OK) {
+#if BOARD_AUDIO_DEBUG_LOGS
+        ESP_LOGW(TAG, "rx read failed: ret=%d bytes=%d", read_ret, read_bytes);
+#endif
         return 0;
     }
 
-    const size_t got_samples = (size_t)read_bytes / sizeof(s_raw_samples[0]);
+    const size_t got_samples = read_count;
     const size_t out_count = audio_decim_process(&s_decim_state, s_raw_samples,
                                                  got_samples, samples, (uint32_t)decim);
     capture_samples(samples, out_count);
@@ -148,8 +168,8 @@ size_t audio_input_read(int16_t *samples, size_t max_samples, uint32_t timeout_m
             s_sum_sq += (int32_t)sample * (int32_t)sample;
         }
         const int32_t rms = out_count ? (int32_t)sqrt((double)s_sum_sq / (double)out_count) : 0;
-        ESP_LOGI(TAG, "rx bytes=%d raw=%u out=%u S[%d,%d] abs=%d rms=%d",
-                 read_bytes, (unsigned)got_samples, (unsigned)out_count, s_min, s_max,
+        ESP_LOGI(TAG, "rx ret=%d bytes=%d raw=%u out=%u S[%d,%d] abs=%d rms=%d",
+                 read_ret, read_bytes, (unsigned)got_samples, (unsigned)out_count, s_min, s_max,
                  out_count ? (int)(s_abs_sum / (int64_t)out_count) : 0, (int)rms);
     }
 #endif

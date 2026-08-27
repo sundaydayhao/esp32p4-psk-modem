@@ -13,7 +13,8 @@ typedef enum {
     UI_EVENT_TX_MODE_CHANGED,
     UI_EVENT_DISPLAY_ROLE_CHANGED,
     UI_EVENT_TX_TEXT,
-    UI_EVENT_OUTPUT_GAIN
+    UI_EVENT_OUTPUT_GAIN,
+    UI_EVENT_TX_STOP
 } ui_event_type_t;
 
 typedef struct {

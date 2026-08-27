@@ -1,6 +1,5 @@
 # ESP-IDF build output
 build/
-build-idf/
 sdkconfig.old
 
 # ESP-IDF component manager cache/output

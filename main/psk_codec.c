@@ -120,18 +120,33 @@ size_t psk_codec_conv_encode_bits(uint8_t *out, size_t out_cap, const uint8_t *i
         return 0U;
     }
 
-    const uint32_t mask = (1UL << k) - 1UL;
     uint32_t state = 0U;
     size_t pos = 0U;
     for (size_t i = 0U; i < in_len; ++i) {
-        state = ((state << 1U) | (uint32_t)(in[i] & 1U)) & mask;
         if (pos + 2U > out_cap) {
             return 0U;
         }
-        out[pos++] = (uint8_t)parity32(state & poly1);
-        out[pos++] = (uint8_t)parity32(state & poly2);
+        uint8_t pair[2];
+        (void)psk_codec_conv_encode_bit(&state, in[i], k, poly1, poly2, pair);
+        out[pos++] = pair[0];
+        out[pos++] = pair[1];
     }
     return pos;
+}
+
+uint8_t psk_codec_conv_encode_bit(uint32_t *state, uint8_t bit, uint8_t k,
+                                  uint32_t poly1, uint32_t poly2,
+                                  uint8_t out_pair[2])
+{
+    if (!state || !out_pair || k < 2U || k > 16U) {
+        return 0U;
+    }
+
+    const uint32_t mask = (1UL << k) - 1UL;
+    *state = ((*state << 1U) | (uint32_t)(bit & 1U)) & mask;
+    out_pair[0] = (uint8_t)parity32(*state & poly1);
+    out_pair[1] = (uint8_t)parity32(*state & poly2);
+    return 1U;
 }
 
 void psk_codec_interleave2_reset(uint8_t *table, size_t table_len)
@@ -169,17 +184,18 @@ uint8_t psk_codec_phase_index_from_symbol(psk_mode_family_t family, uint8_t fec,
         return (uint8_t)((symbol & 1U) ? 0U : 2U);
     }
     if (family == PSK_MODE_FAMILY_QPSK) {
-        /* Receiver-observed inverse of fldigi's QPSK TX mapping:
-         * tx sym -> (4 - sym) quarter-turns, with this audio I/Q convention. */
-        static const uint8_t map[4] = {2U, 3U, 0U, 1U};
+        /* fldigi USB QPSK: sym=(4-sym)&3, then sym_vec_pos[sym*4].
+         * sym_vec_pos[0] is 180 degrees, so encoder symbols map to
+         * phase indexes 0/90/180/270 as {2,1,0,3}. */
+        static const uint8_t map[4] = {2U, 1U, 0U, 3U};
         return map[symbol & 3U];
     }
     if (fec) {
-        /* fldigi graymapped_8psk_pos, negated for this TX/RX phase convention. */
-        static const uint8_t map_fec[8] = {0U, 7U, 5U, 6U, 1U, 2U, 4U, 3U};
+        /* fldigi graymapped_8psk_pos constellation. */
+        static const uint8_t map_fec[8] = {0U, 1U, 3U, 2U, 7U, 6U, 4U, 5U};
         return map_fec[symbol & 7U];
     }
-    static const uint8_t map[8] = {4U, 3U, 2U, 1U, 0U, 7U, 6U, 5U};
+    static const uint8_t map[8] = {4U, 5U, 6U, 7U, 0U, 1U, 2U, 3U};
     return map[symbol & 7U];
 }
 
@@ -190,15 +206,15 @@ uint8_t psk_codec_symbol_from_phase_index(psk_mode_family_t family, uint8_t fec,
     }
     if (family == PSK_MODE_FAMILY_QPSK) {
         /* See psk_codec_phase_index_from_symbol(); the QPSK map is self-inverse. */
-        static const uint8_t map[4] = {2U, 3U, 0U, 1U};
+        static const uint8_t map[4] = {2U, 1U, 0U, 3U};
         return map[phase_idx & 3U];
     }
     if (fec) {
-        /* Inverse of the receiver-observed fldigi Gray 8PSK FEC constellation. */
-        static const uint8_t map_fec[8] = {0U, 4U, 5U, 7U, 6U, 2U, 3U, 1U};
+        /* Inverse of fldigi graymapped_8psk_pos constellation. */
+        static const uint8_t map_fec[8] = {0U, 1U, 3U, 2U, 6U, 7U, 5U, 4U};
         return map_fec[phase_idx & 7U];
     }
-    static const uint8_t map[8] = {4U, 3U, 2U, 1U, 0U, 7U, 6U, 5U};
+    static const uint8_t map[8] = {4U, 5U, 6U, 7U, 0U, 1U, 2U, 3U};
     return map[phase_idx & 7U];
 }
 

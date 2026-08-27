@@ -1,7 +1,6 @@
 # Builds tools/host_psk_rtty_wav.exe using the MSVC host toolchain (not the ARM cross
-# toolchain used by the ESP-IDF firmware build). This lets the real shipped decoder
-# (components/psk_rtty/psk_rtty.c) run natively on Windows against WAV files, instead
-# of relying on tools/wav_decode_regression.py's independent Python reimplementation.
+# toolchain used by the ESP-IDF firmware build). This lets the real shipped PSK
+# modem code run natively on Windows against WAV files.
 param(
     [string]$VcVarsAll = "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvarsall.bat",
     [string]$CygwinGcc = "C:\cygwin64\bin\gcc.exe",
@@ -32,7 +31,7 @@ $incDecim = Join-Path $root "main"
 
 $built = $false
 if (Test-Path $VcVarsAll) {
-    $cmd = "call `"$VcVarsAll`" x64 >NUL 2>NUL && cl /nologo /std:c11 /O2 /MT /W3 /I `"$incDir`" /I `"$incDecim`" `"$srcTool`" `"$srcCore`" `"$srcDecim`" `"$srcModes`" `"$srcCodec`" /Fe:`"$outExe`" /Fo:`"$OutDir\\`" && cl /nologo /std:c11 /O2 /MT /W3 /I `"$incDir`" /I `"$incDecim`" `"$srcRoundtrip`" `"$srcCore`" `"$srcDecim`" `"$srcRx`" `"$srcModes`" `"$srcCodec`" `"$srcTx`" /Fe:`"$roundtripExe`" /Fo:`"$OutDir\\`""
+    $cmd = "call `"$VcVarsAll`" x64 >NUL 2>NUL && cl /nologo /std:c11 /O2 /MT /W3 /I `"$incDir`" /I `"$incDecim`" `"$srcTool`" `"$srcCore`" `"$srcDecim`" `"$srcRx`" `"$srcModes`" `"$srcCodec`" /Fe:`"$outExe`" /Fo:`"$OutDir\\`" && cl /nologo /std:c11 /O2 /MT /W3 /I `"$incDir`" /I `"$incDecim`" `"$srcRoundtrip`" `"$srcCore`" `"$srcDecim`" `"$srcRx`" `"$srcModes`" `"$srcCodec`" `"$srcTx`" /Fe:`"$roundtripExe`" /Fo:`"$OutDir\\`""
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     $result = cmd.exe /c $cmd 2>&1
@@ -46,7 +45,7 @@ if (-not $built -and (Test-Path $CygwinGcc)) {
     $env:PATH = "$(Split-Path -Parent $CygwinGcc);$env:PATH"
     & $CygwinGcc -std=c11 -O2 -Wall -Wextra `
         -I $incDir -I $incDecim `
-        $srcTool $srcCore $srcDecim $srcModes $srcCodec -lm -o $outExe
+        $srcTool $srcCore $srcDecim $srcRx $srcModes $srcCodec -lm -o $outExe
     if ($LASTEXITCODE -ne 0) {
         Write-Error "cygwin gcc build failed: $outExe not produced"
         exit 1

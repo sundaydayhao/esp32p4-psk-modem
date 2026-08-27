@@ -1,5 +1,8 @@
 #pragma once
 
+#include <stddef.h>
+#include <stdint.h>
+
 #include "esp_err.h"
 #include "rx_modem.h"
 #include "spectrum.h"
@@ -17,11 +20,18 @@ typedef struct {
     int tx_tone_hz;
     int display_role;
     int tx_active;
+    int update_waterfall;
     size_t tx_queued;
+    uint16_t input_abs_avg;
+    uint8_t selected_lane;
 } display_state_t;
 
 esp_err_t display_init(void);
 void display_append_text(display_state_t *state, const char *text);
 void display_render(const display_state_t *state, const spectrum_t *spectrum);
 int display_take_tone_selection(int *tone_hz);
+int display_take_mode_selection(psk_mode_t *mode);
+int display_take_role_selection(int *display_role);
+int display_take_tx_text_selection(uint8_t *index);
+void display_set_tx_text_selection(uint8_t index);
 void display_task_handler(void);

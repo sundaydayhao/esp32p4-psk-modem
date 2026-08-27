@@ -1,5 +1,7 @@
 import argparse
+import importlib
 import re
+import sys
 import threading
 import time
 import wave
@@ -8,6 +10,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import serial
+
+IDF_PYSERIAL_SITE = Path(r"C:\Espressif\tools\python\v5.5.5\venv\Lib\site-packages")
+if not hasattr(serial, "Serial") and IDF_PYSERIAL_SITE.exists():
+    sys.path.insert(0, str(IDF_PYSERIAL_SITE))
+    sys.modules.pop("serial", None)
+    serial = importlib.import_module("serial")
 
 
 DEFAULT_MODES = [
@@ -84,6 +92,7 @@ def normalize_text(text: str) -> str:
 
 
 def strip_logs(text: str) -> str:
+    text = re.sub(r"[EWIDV] \(\d+\) [^\r\n]*(?:\r?\n)?", "\n", text)
     kept = []
     for line in text.replace("\r", "\n").split("\n"):
         if re.match(r"^[EWIDV] \(\d+\) ", line):
@@ -259,6 +268,41 @@ def make_wav_clip(src: Path, dst: Path, offset_seconds: float, max_seconds: floa
     return frames / float(rate)
 
 
+def play_wav(path: Path, device: int | None, differential_stereo: bool, left_only: bool) -> None:
+    if device is None:
+        winsound.PlaySound(str(path), winsound.SND_FILENAME)
+        return
+
+    import numpy as np
+    import sounddevice as sd
+
+    with wave.open(str(path), "rb") as wav:
+        channels = wav.getnchannels()
+        sample_width = wav.getsampwidth()
+        sample_rate = wav.getframerate()
+        frames = wav.readframes(wav.getnframes())
+
+    if sample_width != 2:
+        raise ValueError(f"unsupported WAV sample width: {sample_width}")
+
+    audio = np.frombuffer(frames, dtype="<i2")
+    if channels > 1:
+        audio = audio.reshape(-1, channels)
+    else:
+        mono = audio.reshape(-1, 1)
+        audio = np.repeat(mono, 2, axis=1)
+
+    if differential_stereo:
+        mono = audio[:, 0].astype(np.int16)
+        audio = np.column_stack((mono, np.clip(-mono.astype(np.int32), -32768, 32767).astype(np.int16)))
+    elif left_only:
+        mono = audio[:, 0].astype(np.int16)
+        audio = np.column_stack((mono, np.zeros_like(mono)))
+
+    sd.play(audio, samplerate=sample_rate, device=device, blocking=True)
+    sd.stop()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", default="COM14")
@@ -274,10 +318,16 @@ def main() -> int:
     parser.add_argument("--max-seconds", type=float, default=45.0)
     parser.add_argument("--gain", type=float, default=0.25)
     parser.add_argument("--min-fragment", type=int, default=60)
+    parser.add_argument("--device", type=int, help="sounddevice output device index; defaults to winsound")
+    parser.add_argument("--differential-stereo", action="store_true")
+    parser.add_argument("--left-only", action="store_true")
+    parser.add_argument("--raw-log-dir", type=Path, help="directory for unfiltered serial logs")
     args = parser.parse_args()
 
     modes = args.mode or (ALL_PSK if args.all_psk else (ALL_BPSK_QPSK if args.all_bpsk_qpsk else DEFAULT_MODES))
     expected = args.expected.read_text(encoding="utf-8")
+    if args.raw_log_dir:
+        args.raw_log_dir.mkdir(parents=True, exist_ok=True)
 
     cap = SerialCapture(args.port, args.baud)
     try:
@@ -302,10 +352,13 @@ def main() -> int:
                 clip_path = tmp_dir / f"{mode}.wav"
                 clip_dur = make_wav_clip(wav_path, clip_path, args.offset, args.max_seconds, args.gain)
                 print(f"{mode:9s} play {clip_dur:.1f}s/{full_dur:.1f}s offset={args.offset:.1f}s gain={args.gain:.2f}", flush=True)
-                winsound.PlaySound(str(clip_path), winsound.SND_FILENAME)
+                play_wav(clip_path, args.device, args.differential_stereo, args.left_only)
                 time.sleep(args.tail)
 
-                raw = cap.snapshot().decode("utf-8", errors="ignore")
+                raw_bytes = cap.snapshot()
+                if args.raw_log_dir:
+                    (args.raw_log_dir / f"{mode}.log").write_bytes(raw_bytes)
+                raw = raw_bytes.decode("utf-8", errors="ignore")
                 decoded = strip_logs(raw)
                 stats = best_error_stats(decoded, expected)
                 ok = has_expected_fragment(decoded, expected, args.min_fragment)

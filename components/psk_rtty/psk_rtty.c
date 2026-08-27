@@ -6,8 +6,6 @@
 
 #ifdef ESP_PLATFORM
 #include "esp_attr.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #endif
 
 #include "PSKTables.h"
@@ -46,6 +44,8 @@
 #define VIT_MAX_STATES 32768U
 #define FEC_BRANCH_VOTE_HYSTERESIS 64
 #define FEC_BRANCH_LOCK_VOTES 16U
+#define FEC_K16_BRANCH_VOTE_HYSTERESIS 64
+#define FEC_K16_BRANCH_LOCK_VOTES 8U
 #define FEC_PHASE_EVAL_PAIRS 384U
 #define RX_ACQUIRE_SYMBOLS 32U
 #define DD_AFC_ACQUIRE_GAIN 0.06f
@@ -57,8 +57,8 @@
 #define PSK8_NDA_TRACK_GAIN 0.001f
 #define PSK8_SOFT_SCALE 350.0f
 #if defined(ESP_PLATFORM)
-#define PSK_FAST_TEXT
-#define PSK_FAST_BSS EXT_RAM_BSS_ATTR
+#define PSK_FAST_TEXT IRAM_ATTR
+#define PSK_FAST_BSS
 #define PSK_SDRAM_BSS EXT_RAM_BSS_ATTR
 #elif defined(__GNUC__) && defined(__riscv)
 #define PSK_FAST_TEXT __attribute__((section(".fast")))
@@ -72,21 +72,6 @@
 #define PSK_FAST_TEXT
 #define PSK_FAST_BSS
 #define PSK_SDRAM_BSS
-#endif
-
-#if defined(ESP_PLATFORM)
-static inline void psk_runtime_yield(uint16_t nstates, uint16_t state_base)
-{
-    if (nstates >= 32768U && state_base != 0U && (state_base & 0x1fffU) == 0U) {
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-}
-#else
-static inline void psk_runtime_yield(uint16_t nstates, uint16_t state_base)
-{
-    (void)nstates;
-    (void)state_base;
-}
 #endif
 
 typedef struct {
@@ -140,8 +125,12 @@ static void reset_fec_branch(psk_rtty_rx_t *rx, uint8_t branch_index);
 static void reset_fec_acquisition(psk_rtty_rx_t *rx);
 static void update_fec_phase_search(psk_rtty_rx_t *rx, fec_branch_state_t *branch);
 static uint32_t fec_ready_pairs_required(const psk_rtty_rx_t *rx);
+static uint32_t fec_branch_lock_pairs_required(const psk_rtty_rx_t *rx);
+static int fec_branch_vote_hysteresis(const psk_rtty_rx_t *rx);
+static uint8_t fec_branch_lock_votes_required(const psk_rtty_rx_t *rx);
 static int is_rx_text_char(unsigned char ch);
-static int fec_branch_selected(uint8_t branch_index);
+static int fec_branch_selected(const psk_rtty_rx_t *rx, uint8_t branch_index);
+static int fec_branch_can_emit(const psk_rtty_rx_t *rx, uint8_t branch_index);
 static void update_fec_branch_lock(psk_rtty_rx_t *rx);
 static int rx_signal_ready(const psk_rtty_rx_t *rx);
 static int rx_fec_ready(const psk_rtty_rx_t *rx);
@@ -197,6 +186,8 @@ typedef struct {
     uint16_t interleave_depth;
     uint32_t fec_poly1;
     uint32_t fec_poly2;
+    uint16_t modem_sample_rate_hz;
+    uint16_t symbol_samples;
     float baud;
 } psk_mode_params_t;
 
@@ -237,6 +228,8 @@ static psk_mode_params_t mode_params(psk_rtty_mode_t mode)
         .interleave_depth = 0,
         .fec_poly1 = 0,
         .fec_poly2 = 0,
+        .modem_sample_rate_hz = 8000,
+        .symbol_samples = 256,
         .baud = 31.25f,
     };
     switch (mode) {
@@ -325,6 +318,7 @@ static psk_mode_params_t mode_params(psk_rtty_mode_t mode)
         p.bits_per_symbol = 3;
         p.mfsk_varicode = 1;
         p.decision_directed_afc = 1;
+        p.modem_sample_rate_hz = 16000;
         if (mode == PSK_RTTY_MODE_8PSK250 || mode == PSK_RTTY_MODE_8PSK250F) {
             p.baud = 250.0f;
         } else if (mode == PSK_RTTY_MODE_8PSK500 || mode == PSK_RTTY_MODE_8PSK500F) {
@@ -376,9 +370,15 @@ static psk_mode_params_t mode_params(psk_rtty_mode_t mode)
     if (p.interleave_depth != 0U) {
         p.fec_settle_half_interleaves = 2U;
     }
-    if (p.punctured && p.mfsk_varicode && p.fec_k <= 7U) {
+    if (mode == PSK_RTTY_MODE_8PSK1000F || mode == PSK_RTTY_MODE_8PSK1200F) {
         p.fec_settle_tracebacks = 2U;
         p.fec_settle_half_interleaves = 5U;
+    }
+    if (p.baud > 0.0f && p.modem_sample_rate_hz != 0U) {
+        p.symbol_samples = (uint16_t)((float)p.modem_sample_rate_hz / p.baud + 0.5f);
+        if (p.symbol_samples == 0U) {
+            p.symbol_samples = 1U;
+        }
     }
     return p;
 }
@@ -410,14 +410,19 @@ static void reset_runtime(psk_rtty_rx_t *rx)
     rx->psk8_eighth_prev.y = 0.0f;
     rx->psk8_eighth_valid = 0U;
     rx->bit_phase_pos = 0.0f;
-    rx->second_decim = (int)((float)rx->config.sample_rate_hz / (params.baud * 16.0f) + 0.5f);
+    const uint16_t fldigi_decim = params.symbol_samples > 15U ?
+        (uint16_t)(params.symbol_samples / 16U) : 1U;
+    const float fldigi_timing_rate = fldigi_decim != 0U ?
+        (float)params.modem_sample_rate_hz / (float)fldigi_decim :
+        (float)params.modem_sample_rate_hz;
+    rx->second_decim = (int)((float)rx->config.sample_rate_hz / fldigi_timing_rate + 0.5f);
     if (rx->second_decim < 1) {
         rx->second_decim = 1;
     }
-    /* Legacy rates choose an integer decimation that yields 16
-     * samples/symbol.  1200F is 16000/13 baud, leaving exactly 13 samples at
-     * the 16 kHz receiver; keep its timing loop in the reachable 13-bin
-     * domain instead of assuming all 16 legacy bins are present. */
+    /* Match fldigi's mode table: normal PSK uses an 8 kHz modem rate and
+     * 8PSK uses 16 kHz.  fldigi's first PSK filter decimates by
+     * symbollen/16 when symbollen > 15, otherwise it keeps the native short
+     * symbol length (for example BPSK1000=8, 2xPSK800=10, 8PSK1200F=13). */
     rx->timing_bins = (int)((float)rx->config.sample_rate_hz /
                             (params.baud * (float)rx->second_decim) + 0.5f);
     if (rx->timing_bins < 4) {
@@ -630,14 +635,26 @@ static void push_mfsk_varicode_bit(psk_rtty_rx_t *rx, int bit)
     }
 }
 
-static int fec_branch_selected(uint8_t branch_index)
+static int fec_branch_vote_hysteresis(const psk_rtty_rx_t *rx)
+{
+    return (rx->psk_family == PSK_FAMILY_8PSK && rx->fec_k == 16U) ?
+           FEC_K16_BRANCH_VOTE_HYSTERESIS : FEC_BRANCH_VOTE_HYSTERESIS;
+}
+
+static uint8_t fec_branch_lock_votes_required(const psk_rtty_rx_t *rx)
+{
+    return (rx->psk_family == PSK_FAMILY_8PSK && rx->fec_k == 16U) ?
+           FEC_K16_BRANCH_LOCK_VOTES : FEC_BRANCH_LOCK_VOTES;
+}
+
+static int fec_branch_selected(const psk_rtty_rx_t *rx, uint8_t branch_index)
 {
     fec_branch_state_t *branch = &s_fec_branch[branch_index];
     fec_branch_state_t *other = &s_fec_branch[branch_index ^ 1U];
     if (!branch->metric_ready || !other->metric_ready) {
         return 0;
     }
-    return branch->metric_ave > other->metric_ave + FEC_BRANCH_VOTE_HYSTERESIS;
+    return branch->metric_ave > other->metric_ave + fec_branch_vote_hysteresis(rx);
 }
 
 static void update_fec_branch_lock(psk_rtty_rx_t *rx)
@@ -645,15 +662,15 @@ static void update_fec_branch_lock(psk_rtty_rx_t *rx)
     if (!rx->fec_dual_branch || rx->fec_locked_branch < 2U) {
         return;
     }
-    const uint32_t required = fec_ready_pairs_required(rx);
+    const uint32_t required = fec_branch_lock_pairs_required(rx);
     if (s_fec_branch[0].pair_count <= required || s_fec_branch[1].pair_count <= required) {
         return;
     }
 
     uint8_t candidate = 0xffU;
-    if (fec_branch_selected(0U)) {
+    if (fec_branch_selected(rx, 0U)) {
         candidate = 0U;
-    } else if (fec_branch_selected(1U)) {
+    } else if (fec_branch_selected(rx, 1U)) {
         candidate = 1U;
     }
     if (candidate >= 2U) {
@@ -666,10 +683,11 @@ static void update_fec_branch_lock(psk_rtty_rx_t *rx)
         rx->fec_vote_count = 1U;
         return;
     }
-    if (rx->fec_vote_count < FEC_BRANCH_LOCK_VOTES) {
+    const uint8_t votes_required = fec_branch_lock_votes_required(rx);
+    if (rx->fec_vote_count < votes_required) {
         rx->fec_vote_count++;
     }
-    if (rx->fec_vote_count >= FEC_BRANCH_LOCK_VOTES) {
+    if (rx->fec_vote_count >= votes_required) {
         rx->fec_locked_branch = candidate;
         rx->debug_fec_selected = candidate;
     }
@@ -678,10 +696,9 @@ static void update_fec_branch_lock(psk_rtty_rx_t *rx)
 static void push_mfsk_varicode_bit_branch(psk_rtty_rx_t *rx, fec_branch_state_t *branch,
                                           uint8_t branch_index, int bit)
 {
-    const int can_decode = branch_index == rx->fec_locked_branch &&
-                           branch->pair_count > fec_ready_pairs_required(rx) &&
+    const int can_decode = branch->pair_count > fec_ready_pairs_required(rx) &&
                            rx_signal_ready(rx) &&
-                           fec_branch_selected(branch_index);
+                           fec_branch_can_emit(rx, branch_index);
     if (!can_decode) {
         branch->bit_acc = 1U;
         return;
@@ -780,6 +797,11 @@ static uint32_t fec_ready_pairs_required(const psk_rtty_rx_t *rx)
     return required;
 }
 
+static uint32_t fec_branch_lock_pairs_required(const psk_rtty_rx_t *rx)
+{
+    return fec_ready_pairs_required(rx);
+}
+
 static int rx_signal_ready(const psk_rtty_rx_t *rx)
 {
     return rx->warmup_symbols <= 0 && rx->sq_open &&
@@ -793,14 +815,25 @@ static int rx_fec_ready(const psk_rtty_rx_t *rx)
     }
 
     const uint32_t required = fec_ready_pairs_required(rx);
-    if (!rx->fec_output_enabled || s_fec_branch[0].pair_count <= required) {
+    if (!rx->fec_output_enabled) {
         return 0;
     }
     if (!rx->fec_dual_branch) {
-        return 1;
+        return s_fec_branch[0].pair_count > required;
     }
     return rx->fec_locked_branch < 2U &&
            s_fec_branch[rx->fec_locked_branch].pair_count > required;
+}
+
+static int fec_branch_can_emit(const psk_rtty_rx_t *rx, uint8_t branch_index)
+{
+    if (!rx->fec_dual_branch) {
+        return 1;
+    }
+    if (rx->fec_locked_branch < 2U) {
+        return branch_index == rx->fec_locked_branch;
+    }
+    return 0;
 }
 
 static void refresh_lock_state(psk_rtty_rx_t *rx)
@@ -1045,7 +1078,6 @@ static PSK_FAST_TEXT int fec_decode_pair(psk_rtty_rx_t *rx, fec_branch_state_t *
             }
         }
         decision_row[state_base >> 3U] = decision_byte;
-        psk_runtime_yield(nstates, state_base);
     }
 
     if (max_metric > 12000) {
@@ -1093,7 +1125,7 @@ static void decode_fec_pair_for_branch(psk_rtty_rx_t *rx, uint8_t branch_index, 
             if (rx->fec_locked_branch < 2U) {
                 rx->debug_fec_selected = rx->fec_locked_branch;
             } else {
-                rx->debug_fec_selected = fec_branch_selected(1U) ? 1U : 0U;
+                rx->debug_fec_selected = fec_branch_selected(rx, 1U) ? 1U : 0U;
             }
         }
         push_payload_bits_from_fec(rx, branch, branch_index, decoded);
@@ -1400,7 +1432,7 @@ static PSK_FAST_TEXT void psk_channel_rx_feed(psk_rtty_rx_t *rx, const int16_t *
 
         for (uint8_t car = 0; car < active; ++car) {
             rx->chan_mix_i_acc[car] += sample * rx->carrier_cos[car];
-            rx->chan_mix_q_acc[car] -= sample * rx->carrier_sin[car];
+            rx->chan_mix_q_acc[car] += sample * rx->carrier_sin[car];
 
             float rot_cos = rx->carrier_rot_cos[car];
             float rot_sin = rx->carrier_rot_sin[car];
@@ -1510,47 +1542,45 @@ static uint8_t bpsk_soft_bit(psk_rtty_rx_t *rx, float angle, float signal_amp)
     return (uint8_t)(soft + 0.5f);
 }
 
-/* Max-log soft demapper.  The previous code assigned one common quality to
- * all three bits and converted a whole 8PSK symbol to erasures near a decision
- * boundary.  8PSK bit reliabilities are not equal: retain the distance to the
- * nearest constellation point for each bit value so the Viterbi decoder can
- * still use the reliable bits of an uncertain symbol. */
-static uint8_t psk8_soft_bit(float angle, int bit)
-{
-    const float step = TWO_PI / 8.0f;
-    float best_zero = -2.0f;
-    float best_one = -2.0f;
-
-    for (uint8_t phase = 0U; phase < 8U; ++phase) {
-        const float score = cosf(angle - step * (float)phase);
-        if (s_gray_8psk_softbits[phase][bit] >= 128U) {
-            if (score > best_one) {
-                best_one = score;
-            }
-        } else if (score > best_zero) {
-            best_zero = score;
-        }
-    }
-
-    float soft = 128.0f + PSK8_SOFT_SCALE * (best_one - best_zero);
-    if (soft < 0.0f) {
-        soft = 0.0f;
-    } else if (soft > 255.0f) {
-        soft = 255.0f;
-    }
-    return (uint8_t)(soft + 0.5f);
-}
-
 static void push_8psk_soft_bits(psk_rtty_rx_t *rx, float angle)
 {
-    const float demap_angle = angle == 0.0f ? 0.0f : TWO_PI - angle;
+    const float demap_angle = angle;
+    const uint8_t bitindex = phase_index(demap_angle, 8U);
+    float phase_quality = fabsf(cosf(4.0f * demap_angle));
+    int soft_quality_error;
+
+    phase_quality = (phase_quality + rx->psk8_last_phase_quality) * 0.5f;
+    rx->psk8_last_phase_quality = phase_quality;
+
+    soft_quality_error = (int)(128.0f - (128.0f * phase_quality));
+    if (soft_quality_error > (255 - 25) ||
+        soft_quality_error > (128 - (128 / 8))) {
+        for (uint8_t bit = 0U; bit < 3U; ++bit) {
+            rx->debug_soft_ambiguous++;
+            push_fec_encoded_bit(rx, FEC_PUNCTURE);
+        }
+        return;
+    }
+    if (soft_quality_error < (128 / 3)) {
+        soft_quality_error = 0;
+    } else {
+        soft_quality_error /= 2;
+    }
+
     for (int bit = 2; bit >= 0; --bit) {
-        const uint8_t soft = psk8_soft_bit(demap_angle, bit);
+        const uint8_t base = s_gray_8psk_softbits[bitindex][bit];
+        int soft = base > 128U ? (int)base - soft_quality_error :
+                                  (int)base + soft_quality_error;
+        if (soft < 0) {
+            soft = 0;
+        } else if (soft > 255) {
+            soft = 255;
+        }
         const int distance = (int)soft - 128;
         if (distance > -8 && distance < 8) {
             rx->debug_soft_ambiguous++;
         }
-        push_fec_encoded_bit(rx, soft);
+        push_fec_encoded_bit(rx, (uint8_t)soft);
     }
 }
 
@@ -1558,13 +1588,12 @@ static void process_raw_symbol(psk_rtty_rx_t *rx, uint8_t symbol, uint8_t phase_
                                float angle, float signal_amp)
 {
     rx->debug_symbols++;
+    if (signal_amp <= 0.05f) {
+        return;
+    }
     if (rx->warmup_symbols > 0) {
         rx->warmup_symbols--;
         refresh_lock_state(rx);
-        return;
-    }
-
-    if (rx->fec_enabled && signal_amp <= 0.05f) {
         return;
     }
 
@@ -1653,7 +1682,7 @@ static void update_decision_directed_afc(psk_rtty_rx_t *rx, float angle, uint8_t
     const float residual_per_sample = error / rx->symbol_period_samples;
     rx->q_freq_error = 0.9f * rx->q_freq_error + 0.1f * residual_per_sample;
     const float gain = rx->debug_chars == 0U ? DD_AFC_ACQUIRE_GAIN : DD_AFC_TRACK_GAIN;
-    rx->freq_error += gain * residual_per_sample;
+    rx->freq_error -= gain * residual_per_sample;
     if (rx->freq_error > rx->afc_limit) {
         rx->freq_error = rx->afc_limit;
     } else if (rx->freq_error < -rx->afc_limit) {
@@ -1743,13 +1772,12 @@ static uint8_t qpsk_soft_bit(float angle, uint8_t bit_mask)
 static void process_qpsk_symbol(psk_rtty_rx_t *rx, float angle, int signal_valid)
 {
     rx->debug_symbols++;
+    if (!signal_valid) {
+        return;
+    }
     if (rx->warmup_symbols > 0) {
         rx->warmup_symbols--;
         refresh_lock_state(rx);
-        return;
-    }
-
-    if (!signal_valid) {
         return;
     }
 
@@ -1852,6 +1880,13 @@ static PSK_FAST_TEXT void finish_channel_psk_symbol(psk_rtty_rx_t *rx)
         active = 1U;
     }
 
+    float angles[MAX_PSK_CARRIERS] = {0.0f};
+    float dots[MAX_PSK_CARRIERS] = {0.0f};
+    float mags[MAX_PSK_CARRIERS] = {0.0f};
+    uint8_t phase_indices[MAX_PSK_CARRIERS] = {0U};
+    uint8_t symbols[MAX_PSK_CARRIERS] = {0U};
+    uint8_t symbol_ready[MAX_PSK_CARRIERS] = {0U};
+
     float dist_sum = 0.0f;
     uint8_t dist_count = 0U;
     const uint8_t phase_states = rx->psk_family == PSK_FAMILY_QPSK ? 4U :
@@ -1884,11 +1919,12 @@ static PSK_FAST_TEXT void finish_channel_psk_symbol(psk_rtty_rx_t *rx)
                 rx->psk_family != PSK_FAMILY_8PSK) {
                 update_decision_directed_afc(rx, angle, phase_idx, phase_states, mag > 0.05f);
             }
-            if (rx->psk_family == PSK_FAMILY_QPSK) {
-                process_qpsk_symbol(rx, angle, mag > 0.05f);
-            } else {
-                process_raw_symbol(rx, inverse_psk_symbol(rx, angle, dot), phase_idx, angle, mag);
-            }
+            angles[car] = angle;
+            dots[car] = dot;
+            mags[car] = mag;
+            phase_indices[car] = phase_idx;
+            symbols[car] = inverse_psk_symbol(rx, angle, dot);
+            symbol_ready[car] = 1U;
         }
 
         rx->carrier_i_prev[car] = i;
@@ -1898,6 +1934,18 @@ static PSK_FAST_TEXT void finish_channel_psk_symbol(psk_rtty_rx_t *rx)
 
     const float avg_dist = dist_count ? (dist_sum / (float)dist_count) : phase_step;
     update_quality_squelch(rx, avg_dist, phase_step, dist_count > 0U);
+
+    for (uint8_t car = 0; car < active; ++car) {
+        if (!symbol_ready[car]) {
+            continue;
+        }
+        const int signal_valid = mags[car] > 0.05f;
+        if (rx->psk_family == PSK_FAMILY_QPSK) {
+            process_qpsk_symbol(rx, angles[car], signal_valid);
+        } else {
+            process_raw_symbol(rx, symbols[car], phase_indices[car], angles[car], mags[car]);
+        }
+    }
 }
 
 

@@ -18,6 +18,11 @@ static void emit_char(psk_rx_t *m, char c)
     m->out[m->out_len] = '\0';
 }
 
+static int is_plaintext_char(char c)
+{
+    return c == '\r' || c == '\n' || c == '\t' || (c >= 32 && c <= 126);
+}
+
 static void frame1200f_reset(psk1200f_frame_t *frame)
 {
     frame->state = PSK1200F_FRAME_SEARCH;
@@ -25,6 +30,19 @@ static void frame1200f_reset(psk1200f_frame_t *frame)
     frame->base64_len = 0U;
     frame->expected_len = 0U;
     frame->expected_crc = 0U;
+}
+
+static void frame1200f_emit_buffered_header(psk_rx_t *m, char suffix)
+{
+    psk1200f_frame_t *frame = &m->frame1200f;
+    emit_char(m, '~');
+    for (uint16_t i = 0U; i < frame->header_len; ++i) {
+        emit_char(m, frame->header[i]);
+    }
+    if (suffix != '\0' && is_plaintext_char(suffix)) {
+        emit_char(m, suffix);
+    }
+    frame1200f_reset(frame);
 }
 
 static int parse_decimal(const char **cursor, uint32_t *value)
@@ -169,6 +187,20 @@ static uint32_t crc32(const uint8_t *data, size_t length)
     return ~crc;
 }
 
+static int frame1200f_should_deliver(psk1200f_frame_t *frame)
+{
+    if (!frame->sequence_started || frame->sequence == 0U) {
+        frame->sequence_started = 1U;
+        frame->next_sequence = frame->sequence + 1U;
+        return 1;
+    }
+    if (frame->sequence < frame->next_sequence) {
+        return 0;
+    }
+    frame->next_sequence = frame->sequence + 1U;
+    return 1;
+}
+
 static void frame1200f_finish(psk_rx_t *m)
 {
     psk1200f_frame_t *frame = &m->frame1200f;
@@ -180,8 +212,10 @@ static void frame1200f_finish(psk_rx_t *m)
                       sizeof(frame->base64), &payload_len) &&
         payload_len == frame->expected_len &&
         crc32((const uint8_t *)frame->base64, payload_len) == frame->expected_crc) {
-        frame->delivery_len = (uint16_t)payload_len;
-        frame->delivery_pos = 0U;
+        if (frame1200f_should_deliver(frame)) {
+            frame->delivery_len = (uint16_t)payload_len;
+            frame->delivery_pos = 0U;
+        }
         frame->valid_frames++;
     } else {
         frame->invalid_frames++;
@@ -202,10 +236,33 @@ static void frame1200f_deliver(psk_rx_t *m)
     }
 }
 
+static void frame1200f_enter_resync(psk1200f_frame_t *frame)
+{
+    frame->state = PSK1200F_FRAME_RESYNC;
+    frame->header_len = 0U;
+    frame->base64_len = 0U;
+}
+
 static void frame1200f_feed(psk_rx_t *m, char c)
 {
     psk1200f_frame_t *frame = &m->frame1200f;
+    static const char prefix[] = "H1200,";
     if (frame->state == PSK1200F_FRAME_SEARCH) {
+        if (c == '~') {
+            frame->state = PSK1200F_FRAME_HEADER;
+            frame->header_len = 0U;
+        } else if (is_plaintext_char(c)) {
+            emit_char(m, c);
+        }
+        return;
+    }
+    if (frame->state == PSK1200F_FRAME_RESYNC) {
+        /* A bit error corrupted this frame's base64 body. The remaining
+         * body bytes are not trustworthy plaintext (they are undecoded
+         * base64), so discard them silently instead of falling into
+         * PSK1200F_FRAME_SEARCH's literal passthrough, which would leak
+         * the rest of the raw base64 payload into the RX output. Wait for
+         * the next '~' to attempt a fresh frame. */
         if (c == '~') {
             frame->state = PSK1200F_FRAME_HEADER;
             frame->header_len = 0U;
@@ -214,7 +271,13 @@ static void frame1200f_feed(psk_rx_t *m, char c)
     }
     if (frame->state == PSK1200F_FRAME_HEADER) {
         if (c == '~') {
-            frame->header_len = 0U;
+            frame1200f_emit_buffered_header(m, '\0');
+            frame->state = PSK1200F_FRAME_HEADER;
+            return;
+        }
+        if (frame->header_len < sizeof(prefix) - 1U &&
+            c != prefix[frame->header_len]) {
+            frame1200f_emit_buffered_header(m, c);
             return;
         }
         if (c == ':') {
@@ -224,12 +287,12 @@ static void frame1200f_feed(psk_rx_t *m, char c)
                 frame->base64_len = 0U;
                 frame->sync_events++;
             } else {
-                frame1200f_reset(frame);
+                frame1200f_emit_buffered_header(m, ':');
             }
             return;
         }
         if (c < 32 || c > 126 || frame->header_len + 1U >= sizeof(frame->header)) {
-            frame1200f_reset(frame);
+            frame1200f_emit_buffered_header(m, c);
             return;
         }
         frame->header[frame->header_len++] = c;
@@ -241,7 +304,7 @@ static void frame1200f_feed(psk_rx_t *m, char c)
     }
     if ((base64_value(c) < 0 && c != '=') || frame->base64_len + 1U >= sizeof(frame->base64)) {
         frame->invalid_frames++;
-        frame1200f_reset(frame);
+        frame1200f_enter_resync(frame);
         return;
     }
     frame->base64[frame->base64_len++] = c;
@@ -305,6 +368,18 @@ void psk_rx_init(psk_rx_t *m, const psk_rx_config_t *config)
 
 void psk_rx_reset(psk_rx_t *m)
 {
+    backend_init(m);
+}
+
+void psk_rx_set_sample_rate(psk_rx_t *m, int sample_rate_hz)
+{
+    if (!m || sample_rate_hz <= 0) {
+        return;
+    }
+    if (m->config.sample_rate_hz == sample_rate_hz) {
+        return;
+    }
+    m->config.sample_rate_hz = sample_rate_hz;
     backend_init(m);
 }
 

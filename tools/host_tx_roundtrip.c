@@ -8,13 +8,13 @@
 #include <string.h>
 
 #define HOST_CODEC_RATE_HZ 48000
-#define HOST_DECODE_RATE_HZ 16000
-#define HOST_DECIMATION 3
+#define HOST_DECODE_RATE_HZ 48000
+#define HOST_DECIMATION (HOST_CODEC_RATE_HZ / HOST_DECODE_RATE_HZ)
 #define HOST_TONE_HZ 1500
 #define TX_CHUNK 512
 #define DECODE_BLOCK 128
-#define MAX_CODEC_SAMPLES (HOST_CODEC_RATE_HZ * 40)
-#define MAX_DECODE_SAMPLES (HOST_DECODE_RATE_HZ * 40)
+#define MAX_CODEC_SAMPLES (HOST_CODEC_RATE_HZ * 120)
+#define MAX_DECODE_SAMPLES (HOST_DECODE_RATE_HZ * 120)
 #define MAX_DECODED_TEXT 8192
 
 static void append_text(char *dst, size_t cap, const char *src, size_t len)
@@ -50,7 +50,12 @@ static int contains_fragment(const char *decoded, const char *expected)
     return 0;
 }
 
-static int run_mode(psk_mode_t mode, const char *text)
+static int contains_complete_payload(const char *decoded, const char *expected)
+{
+    return strstr(decoded, expected) != NULL;
+}
+
+static int run_mode(psk_mode_t mode, const char *text, int loop_payload)
 {
     const psk_mode_info_t *info = psk_mode_info(mode);
     int16_t *codec = (int16_t *)malloc(MAX_CODEC_SAMPLES * sizeof(int16_t));
@@ -65,9 +70,10 @@ static int run_mode(psk_mode_t mode, const char *text)
 
     psk_tx_t tx;
     psk_tx_init(&tx, HOST_CODEC_RATE_HZ);
-    int rc = psk_tx_start_text(&tx, mode, HOST_TONE_HZ, text);
+    int rc = loop_payload ? psk_tx_start_text_loop(&tx, mode, HOST_TONE_HZ, text) :
+                            psk_tx_start_text(&tx, mode, HOST_TONE_HZ, text);
     if (rc != 0) {
-        printf("FAIL %-11s tx_start=%d\n", info->name, rc);
+        printf("FAIL %-16s tx_start=%d\n", loop_payload ? "8PSK1200F-loop" : info->name, rc);
         free(codec);
         free(decode);
         free(decoded);
@@ -75,7 +81,8 @@ static int run_mode(psk_mode_t mode, const char *text)
     }
 
     size_t codec_count = 0U;
-    while (psk_tx_active(&tx) && codec_count < MAX_CODEC_SAMPLES) {
+    const size_t max_samples = loop_payload ? (HOST_CODEC_RATE_HZ * 20U) : MAX_CODEC_SAMPLES;
+    while (psk_tx_active(&tx) && codec_count < max_samples) {
         size_t n = psk_tx_generate(&tx, codec + codec_count, TX_CHUNK);
         codec_count += n;
         if (n == 0U) {
@@ -110,16 +117,19 @@ static int run_mode(psk_mode_t mode, const char *text)
         }
     }
 
-    const int ok = contains_fragment(decoded, text);
+    const int ok = mode == PSK_MODE_8PSK1200F ?
+        (contains_complete_payload(decoded, text) && strstr(decoded, "H1200,") == NULL) :
+        contains_fragment(decoded, text);
     psk_rx_debug_t debug;
     psk_rx_debug_snapshot(&modem, &debug);
-    printf("%s %-11s tx=%zu dec=%zu decoded=%zu chars=%lu lock=%u sq=%d/%d frame=%lu/%lu/%lu\n",
-           ok ? "PASS" : "FAIL", info->name, codec_count, decode_count, strlen(decoded),
+    printf("%s %-16s tx=%zu dec=%zu decoded=%zu chars=%lu lock=%u sq=%d/%d frame=%lu/%lu/%lu\n",
+           ok ? "PASS" : "FAIL", loop_payload ? "8PSK1200F-loop" : info->name,
+           codec_count, decode_count, strlen(decoded),
            (unsigned long)debug.chars, debug.lock_state, debug.sq_level, debug.sq_thresh,
            (unsigned long)debug.valid_frames, (unsigned long)debug.invalid_frames,
            (unsigned long)debug.frame_sync_events);
     if (!ok && decoded[0] != '\0') {
-        printf("  preview: %.160s\n", decoded);
+        printf("  preview: %.320s\n", decoded);
     }
 
     free(codec);
@@ -131,17 +141,20 @@ static int run_mode(psk_mode_t mode, const char *text)
 int main(int argc, char **argv)
 {
     const char *text = argc > 1 ? argv[1] :
-        "THE QUICK BROWN FOX 0123456789 THE QUICK BROWN FOX 0123456789 "
-        "ESP32P4 PSK MODEM LOOPBACK HOST TEST END";
+        "One warm and sunny spring morning, Lulu hopped into the green forest to help a tiny bird return "
+        "to its nest. True bravery is choosing kindness even when you are scared.";
     int failures = 0;
     for (size_t i = 0U; i < psk_mode_count(); ++i) {
         const psk_mode_info_t *info = psk_mode_info_at(i);
         if (!info || !info->decode_supported) {
             continue;
         }
-        if (run_mode(info->id, text) != 0) {
+        if (run_mode(info->id, text, 0) != 0) {
             ++failures;
         }
+    }
+    if (run_mode(PSK_MODE_8PSK1200F, text, 1) != 0) {
+        ++failures;
     }
     printf("summary: failures=%d\n", failures);
     return failures ? 1 : 0;
