@@ -382,6 +382,45 @@ static int parse_serial_control_command(const char *cmd, const display_state_t *
         return 1;
     }
 
+    if (cmd_starts(cmd, "INGAIN") || cmd_starts(cmd, "MICGAIN")) {
+        const char *arg = skip_command_arg(cmd, cmd_starts(cmd, "INGAIN") ? "INGAIN" : "MICGAIN");
+        char *end = NULL;
+        const float gain_db = strtof(arg, &end);
+        if (end == arg || gain_db < 0.0f || gain_db > 42.0f) {
+            printf("[cmd] error input gain must be: INGAIN <0..42 dB>\r\n");
+            return 1;
+        }
+        event->type = UI_EVENT_INPUT_GAIN;
+        event->input_gain_db = gain_db;
+        printf("[gain] input %.1fdB\r\n", (double)gain_db);
+        return 1;
+    }
+
+    if (cmd_starts(cmd, "RXDIAG") || cmd_starts(cmd, "DIAG")) {
+        event->type = UI_EVENT_RX_DIAG;
+        return 1;
+    }
+
+    if (cmd_starts(cmd, "FECBRANCH")) {
+        const char *arg = skip_spaces(skip_command_arg(cmd, "FECBRANCH"));
+        if (cmd_equals(arg, "AUTO")) {
+            event->type = UI_EVENT_RX_FEC_BRANCH;
+            event->fec_branch_override = -1;
+            printf("[fecbranch] auto\r\n");
+            return 1;
+        }
+        char *end = NULL;
+        const long branch = strtol(arg, &end, 0);
+        if (end == arg || branch < 0 || branch > 1) {
+            printf("[cmd] error FECBRANCH must be AUTO, 0, or 1\r\n");
+            return 1;
+        }
+        event->type = UI_EVENT_RX_FEC_BRANCH;
+        event->fec_branch_override = (int)branch;
+        printf("[fecbranch] %d\r\n", event->fec_branch_override);
+        return 1;
+    }
+
     if (cmd_starts(cmd, "STATUS")) {
         printf("[status] role=%s rxmode=%s psk=%s txmode=%s tone=%dHz txtone=%dHz tx=%d/%u\r\n",
                display_state->display_role ? "TX" : "RX",

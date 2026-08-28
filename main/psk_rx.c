@@ -341,6 +341,9 @@ static void backend_init(psk_rx_t *m)
     m->rx.afc_enabled = m->config.afc_enabled ? 1 : 0;
     m->rx.squelch_enabled = m->config.squelch_enabled ? 1 : 0;
     m->backend_active = 1U;
+    if (m->fec_branch_override == 0 || m->fec_branch_override == 1) {
+        psk_rtty_rx_set_fec_branch_override(&m->rx, m->fec_branch_override);
+    }
 }
 
 static int backend_effective_tone_hz(const psk_rx_t *m)
@@ -363,6 +366,7 @@ void psk_rx_init(psk_rx_t *m, const psk_rx_config_t *config)
 {
     memset(m, 0, sizeof(*m));
     m->config = *config;
+    m->fec_branch_override = -1;
     backend_init(m);
 }
 
@@ -422,6 +426,14 @@ void psk_rx_set_squelch_enabled(psk_rx_t *m, int enabled)
     m->config.squelch_enabled = enabled ? 1 : 0;
     if (m->backend_active) {
         m->rx.squelch_enabled = m->config.squelch_enabled;
+    }
+}
+
+void psk_rx_set_fec_branch_override(psk_rx_t *m, int branch)
+{
+    m->fec_branch_override = (branch == 0 || branch == 1) ? branch : -1;
+    if (m->backend_active) {
+        psk_rtty_rx_set_fec_branch_override(&m->rx, m->fec_branch_override);
     }
 }
 
@@ -487,6 +499,13 @@ void psk_rx_debug_snapshot(const psk_rx_t *m, psk_rx_debug_t *debug)
     debug->valid_frames = m->frame1200f.valid_frames;
     debug->invalid_frames = m->frame1200f.invalid_frames;
     debug->frame_sync_events = m->frame1200f.sync_events;
+    debug->fec_pairs[0] = m->rx.debug_fec_pairs[0];
+    debug->fec_pairs[1] = m->rx.debug_fec_pairs[1];
+    debug->fec_pair_count = m->rx.debug_fec_pair_count;
+    debug->fec_vote_candidate = m->rx.debug_fec_vote_candidate;
+    debug->fec_vote_count = m->rx.debug_fec_vote_count;
+    debug->fec_output_enabled = m->rx.debug_fec_output_enabled;
+    debug->fec_locked_branch = m->rx.debug_fec_locked_branch;
 }
 
 size_t psk_rx_process(psk_rx_t *m, const int16_t *samples, size_t count,

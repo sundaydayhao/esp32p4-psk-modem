@@ -426,7 +426,7 @@ int main(int argc, char **argv)
     size_t decode_count = codec_count;
     int decode_rate = codec_rate;
     int16_t *decimated = NULL;
-    if (codec_rate == HOST_CODEC_RATE_HZ && target_decode_rate != HOST_CODEC_RATE_HZ) {
+    if (codec_rate == HOST_CODEC_RATE_HZ) {
         const uint32_t decimation = (uint32_t)(HOST_CODEC_RATE_HZ / target_decode_rate);
         decimated = (int16_t *)malloc((codec_count / decimation + 1U) * sizeof(int16_t));
         if (!decimated) {

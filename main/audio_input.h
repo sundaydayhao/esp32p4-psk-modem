@@ -6,6 +6,7 @@
 #include "esp_err.h"
 
 esp_err_t audio_input_init(void);
+esp_err_t audio_input_set_gain_db(float gain_db);
 size_t audio_input_read(int16_t *samples, size_t max_samples, uint32_t timeout_ms);
 size_t audio_output_write(const int16_t *samples, size_t count);
 size_t audio_output_queued(void);

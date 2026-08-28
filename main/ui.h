@@ -14,6 +14,9 @@ typedef enum {
     UI_EVENT_DISPLAY_ROLE_CHANGED,
     UI_EVENT_TX_TEXT,
     UI_EVENT_OUTPUT_GAIN,
+    UI_EVENT_INPUT_GAIN,
+    UI_EVENT_RX_DIAG,
+    UI_EVENT_RX_FEC_BRANCH,
     UI_EVENT_TX_STOP
 } ui_event_type_t;
 
@@ -28,6 +31,8 @@ typedef struct {
     int display_role;
     int output_dac_volume;
     int output_hp_volume;
+    float input_gain_db;
+    int fec_branch_override;
     char tx_text[256];
 } ui_event_t;
 

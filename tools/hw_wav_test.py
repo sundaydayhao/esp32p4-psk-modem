@@ -129,6 +129,7 @@ def bit_count(value: int) -> int:
 def best_error_stats(decoded: str, expected: str) -> dict:
     decoded = normalize_text(decoded)
     expected = normalize_text(expected)
+    period = expected + " "
     stats = {
         "decoded_len": len(decoded),
         "best_offset": -1,
@@ -142,35 +143,65 @@ def best_error_stats(decoded: str, expected: str) -> dict:
     if not decoded:
         return stats
 
-    repeated = (expected + " ") * max(2, (len(decoded) // max(1, len(expected))) + 3)
-    if len(decoded) > len(repeated):
-        repeated = repeated * ((len(decoded) // len(repeated)) + 2)
+    def eval_offset(offset: int) -> tuple[int, int, int, int]:
+        char_errors = 0
+        bit_errors = 0
+        plen = len(period)
+        for i, ch in enumerate(decoded):
+            expected_byte = ord(period[(offset + i) % plen]) & 0xff
+            decoded_byte = ord(ch) & 0xff
+            if expected_byte != decoded_byte:
+                char_errors += 1
+                bit_errors += bit_count(expected_byte ^ decoded_byte)
+        total_bits = len(decoded) * 8
+        return bit_errors, char_errors, len(decoded), total_bits
+
+    candidates = {0}
+    plen = len(period)
+    for size in range(min(len(expected), 220), 39, -20):
+        found = False
+        for start in range(0, max(1, len(expected) - size + 1), max(1, size // 4)):
+            pos = decoded.find(expected[start:start + size])
+            if pos >= 0:
+                base = (start - pos) % plen
+                for delta in range(-2, 3):
+                    candidates.add((base + delta) % plen)
+                found = True
+                break
+        if found:
+            break
+
+    if len(candidates) == 1:
+        sample_len = min(len(decoded), 2048)
+        sample = decoded[:sample_len]
+        sample_scores = []
+        for offset in range(plen):
+            char_errors = 0
+            bit_errors = 0
+            for i, ch in enumerate(sample):
+                expected_byte = ord(period[(offset + i) % plen]) & 0xff
+                decoded_byte = ord(ch) & 0xff
+                if expected_byte != decoded_byte:
+                    char_errors += 1
+                    bit_errors += bit_count(expected_byte ^ decoded_byte)
+            sample_scores.append((bit_errors, char_errors, offset))
+        for _, _, offset in sorted(sample_scores)[:8]:
+            for delta in range(-2, 3):
+                candidates.add((offset + delta) % plen)
 
     best_bit_errors = 10**9
     best_char_errors = 10**9
     best_compared = 0
     best_total_bits = 0
     best_offset = -1
-    max_start = max(0, len(repeated) - 1)
-    for start in range(0, max_start + 1):
-        compared = min(len(decoded), len(repeated) - start)
-        if compared <= 0:
-            continue
-        bit_errors = abs(len(decoded) - compared) * 8
-        char_errors = abs(len(decoded) - compared)
-        for i in range(compared):
-            expected_byte = ord(repeated[start + i]) & 0xff
-            decoded_byte = ord(decoded[i]) & 0xff
-            if expected_byte != decoded_byte:
-                char_errors += 1
-                bit_errors += bit_count(expected_byte ^ decoded_byte)
-        total_bits = max(len(decoded), compared) * 8
+    for offset in sorted(candidates):
+        bit_errors, char_errors, compared, total_bits = eval_offset(offset)
         if bit_errors < best_bit_errors or (bit_errors == best_bit_errors and char_errors < best_char_errors):
             best_bit_errors = bit_errors
             best_char_errors = char_errors
             best_compared = compared
             best_total_bits = total_bits
-            best_offset = start
+            best_offset = offset
             if bit_errors == 0:
                 break
 

@@ -4,6 +4,10 @@
 
 #include "esp_check.h"
 #include "esp_log.h"
+#ifdef ESP_PLATFORM
+#include "driver/usb_serial_jtag.h"
+#include "freertos/FreeRTOS.h"
+#endif
 
 static const char *TAG = "transport";
 static transport_mode_t s_mode = TRANSPORT_MODE_USB_SERIAL;
@@ -59,8 +63,12 @@ void transport_send(const uint8_t *data, size_t len)
 
     switch (s_mode) {
     case TRANSPORT_MODE_USB_SERIAL:
+#ifdef ESP_PLATFORM
+        (void)usb_serial_jtag_write_bytes(data, len, pdMS_TO_TICKS(20));
+#else
         fwrite(data, 1, len, stdout);
         fflush(stdout);
+#endif
         break;
     case TRANSPORT_MODE_BT:
     case TRANSPORT_MODE_WIFI:

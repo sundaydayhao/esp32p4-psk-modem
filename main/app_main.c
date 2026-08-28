@@ -141,11 +141,43 @@ static void apply_control_event(modem_t *modem, const ui_event_t *event)
     case UI_EVENT_TONE_CHANGED:
         modem_set_rx_tone(modem, event->tone_hz);
         break;
+    case UI_EVENT_INPUT_GAIN:
+        (void)audio_input_set_gain_db(event->input_gain_db);
+        break;
+    case UI_EVENT_RX_DIAG: {
+        psk_rx_debug_t rx_debug;
+        psk_rx_debug_snapshot(&modem->decoder.psk_rx, &rx_debug);
+        ESP_LOGI(TAG,
+                 "diag psk=%s rx=%d Hz off=%d mHz peak=%d Hz abs=%d lock=%u sq=%d lvl=%d/%d stable=%d warm=%d sym=%u bits=%u z=%u o=%u dd=%u ch=%u unk=%u fec=%d/%d sel=%u locked=%u pairs=%u/%u total=%u vote=%u/%u out=%u soft=%u coarse=%u pk=%d/%d bins=%d frame=%u/%u/%u",
+                 modem_psk_mode_name(modem_get_psk_mode(modem)),
+                 rx_debug.tone_hz, rx_debug.carrier_offset_millihz,
+                 s_waterfall_peak_hz, (int)s_input_abs_avg,
+                 rx_debug.lock_state, rx_debug.sq_open, rx_debug.sq_level, rx_debug.sq_thresh,
+                 rx_debug.stable_symbols, rx_debug.warmup_symbols,
+                 (unsigned)rx_debug.symbols, (unsigned)rx_debug.bits,
+                 (unsigned)rx_debug.zeros, (unsigned)rx_debug.ones,
+                 (unsigned)rx_debug.delims, (unsigned)rx_debug.chars, (unsigned)rx_debug.unknown,
+                 rx_debug.fec_metric[0], rx_debug.fec_metric[1],
+                 (unsigned)rx_debug.fec_selected,
+                 (unsigned)rx_debug.fec_locked_branch,
+                 (unsigned)rx_debug.fec_pairs[0], (unsigned)rx_debug.fec_pairs[1],
+                 (unsigned)rx_debug.fec_pair_count,
+                 (unsigned)rx_debug.fec_vote_candidate, (unsigned)rx_debug.fec_vote_count,
+                 (unsigned)rx_debug.fec_output_enabled,
+                 (unsigned)rx_debug.soft_ambiguous,
+                 (unsigned)rx_debug.coarse_updates,
+                 rx_debug.timing_peak, rx_debug.timing_target, rx_debug.timing_bins,
+                 (unsigned)rx_debug.valid_frames, (unsigned)rx_debug.invalid_frames,
+                 (unsigned)rx_debug.frame_sync_events);
+        break;
+    }
+    case UI_EVENT_RX_FEC_BRANCH:
+        psk_rx_set_fec_branch_override(&modem->decoder.psk_rx, event->fec_branch_override);
+        break;
     case UI_EVENT_TX_MODE_CHANGED:
     case UI_EVENT_DISPLAY_ROLE_CHANGED:
     case UI_EVENT_TX_TEXT:
     case UI_EVENT_OUTPUT_GAIN:
-    case UI_EVENT_TX_STOP:
     case UI_EVENT_NONE:
     default:
         break;
@@ -633,6 +665,15 @@ static void ui_task(void *arg)
             send_tx_cmd(&cmd);
             break;
         }
+        case UI_EVENT_INPUT_GAIN:
+            (void)audio_input_set_gain_db(event.input_gain_db);
+            break;
+        case UI_EVENT_RX_DIAG:
+            (void)xQueueSend(s_control_queue, &event, 0);
+            break;
+        case UI_EVENT_RX_FEC_BRANCH:
+            (void)xQueueSend(s_control_queue, &event, 0);
+            break;
         case UI_EVENT_TX_STOP: {
             tx_cmd_t cmd = {
                 .type = TX_CMD_STOP,

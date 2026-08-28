@@ -22,6 +22,7 @@ static audio_decim_state_t s_decim_state;
 static int16_t s_raw_samples[1536];
 static uint8_t s_dac_volume = 70;
 static uint8_t s_headphone_volume = 70;
+static float s_input_gain_db = BOARD_AUDIO_INPUT_GAIN_DB;
 
 #define AUDIO_INPUT_CAPTURE_MAX_SAMPLES 131072U
 static int16_t s_capture[AUDIO_INPUT_CAPTURE_MAX_SAMPLES] EXT_RAM_BSS_ATTR;
@@ -95,7 +96,7 @@ esp_err_t audio_input_init(void)
     };
     ESP_RETURN_ON_FALSE(esp_codec_dev_open(s_mic_dev, &input_fs) == ESP_CODEC_DEV_OK,
                         ESP_FAIL, TAG, "open microphone codec");
-    int codec_ret = esp_codec_dev_set_in_gain(s_mic_dev, BOARD_AUDIO_INPUT_GAIN_DB);
+    int codec_ret = esp_codec_dev_set_in_gain(s_mic_dev, s_input_gain_db);
     if (codec_ret != ESP_CODEC_DEV_OK) {
         ESP_LOGW(TAG, "set microphone gain failed: %d", codec_ret);
     }
@@ -111,6 +112,20 @@ esp_err_t audio_input_init(void)
     ESP_LOGI(TAG, "ESP32-P4 BSP audio ready: codec %d Hz, modem %d Hz, input lane %d",
              BOARD_CODEC_SAMPLE_RATE_HZ, BOARD_MODEM_SAMPLE_RATE_HZ, BOARD_AUDIO_INPUT_CHANNEL);
     return ESP_OK;
+}
+
+esp_err_t audio_input_set_gain_db(float gain_db)
+{
+    if (gain_db < 0.0f) {
+        gain_db = 0.0f;
+    } else if (gain_db > 42.0f) {
+        gain_db = 42.0f;
+    }
+    s_input_gain_db = gain_db;
+    if (!s_mic_dev) {
+        return ESP_OK;
+    }
+    return esp_codec_dev_set_in_gain(s_mic_dev, gain_db) == ESP_CODEC_DEV_OK ? ESP_OK : ESP_FAIL;
 }
 
 size_t audio_input_read(int16_t *samples, size_t max_samples, uint32_t timeout_ms)

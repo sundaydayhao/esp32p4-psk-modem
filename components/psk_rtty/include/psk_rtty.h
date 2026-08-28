@@ -77,6 +77,7 @@ typedef struct {
     float bpsk_average_amp;
     float psk8_last_phase_quality;
     float psk8_coarse_freq;
+    const float *bit_fir;
     psk_rtty_complex_t psk8_eighth_prev;
     float bit_phase_inc;
     float bit_phase_pos;
@@ -125,6 +126,7 @@ typedef struct {
     uint32_t fec_pair_count;
     uint8_t fec_dual_branch;
     uint8_t fec_locked_branch;
+    uint8_t fec_forced_branch;
     uint8_t fec_vote_candidate;
     uint8_t fec_vote_count;
     uint8_t fec_rxbitstate;
@@ -191,10 +193,17 @@ typedef struct {
     uint32_t debug_soft_ambiguous;
     uint32_t debug_coarse_updates;
     int debug_fec_metric[2];
+    uint32_t debug_fec_pairs[2];
+    uint32_t debug_fec_pair_count;
+    uint8_t debug_fec_vote_candidate;
+    uint8_t debug_fec_vote_count;
+    uint8_t debug_fec_output_enabled;
+    uint8_t debug_fec_locked_branch;
     uint8_t debug_fec_selected;
 } psk_rtty_rx_t;
 
 void psk_rtty_rx_init(psk_rtty_rx_t *rx, const psk_rtty_config_t *config);
 void psk_rtty_rx_set_mode(psk_rtty_rx_t *rx, psk_rtty_mode_t mode);
 void psk_rtty_rx_set_tone(psk_rtty_rx_t *rx, int tone_hz);
+void psk_rtty_rx_set_fec_branch_override(psk_rtty_rx_t *rx, int branch);
 void psk_rtty_rx_feed(psk_rtty_rx_t *rx, const int16_t *samples, size_t count);

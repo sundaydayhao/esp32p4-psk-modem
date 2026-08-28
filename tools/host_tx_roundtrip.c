@@ -153,6 +153,12 @@ int main(int argc, char **argv)
             ++failures;
         }
     }
+    if (run_mode(PSK_MODE_8PSK125F, text, 1) != 0) {
+        ++failures;
+    }
+    if (run_mode(PSK_MODE_8PSK250F, text, 1) != 0) {
+        ++failures;
+    }
     if (run_mode(PSK_MODE_8PSK1200F, text, 1) != 0) {
         ++failures;
     }

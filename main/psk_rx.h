@@ -51,6 +51,7 @@ typedef struct {
     size_t out_size;
     size_t out_len;
     uint8_t backend_active;
+    int fec_branch_override;
     psk1200f_frame_t frame1200f;
 } psk_rx_t;
 
@@ -84,6 +85,12 @@ typedef struct {
     uint32_t valid_frames;
     uint32_t invalid_frames;
     uint32_t frame_sync_events;
+    uint32_t fec_pairs[2];
+    uint32_t fec_pair_count;
+    uint8_t fec_vote_candidate;
+    uint8_t fec_vote_count;
+    uint8_t fec_output_enabled;
+    uint8_t fec_locked_branch;
 } psk_rx_debug_t;
 
 void psk_rx_init(psk_rx_t *m, const psk_rx_config_t *config);
@@ -93,6 +100,7 @@ void psk_rx_set_mode(psk_rx_t *m, psk_mode_t mode);
 void psk_rx_set_tone(psk_rx_t *m, int tone_hz);
 void psk_rx_set_afc(psk_rx_t *m, int enabled);
 void psk_rx_set_squelch_enabled(psk_rx_t *m, int enabled);
+void psk_rx_set_fec_branch_override(psk_rx_t *m, int branch);
 psk_mode_t psk_rx_mode(const psk_rx_t *m);
 int psk_rx_tone_hz(const psk_rx_t *m);
 const char *psk_rx_mode_name(psk_mode_t mode);
