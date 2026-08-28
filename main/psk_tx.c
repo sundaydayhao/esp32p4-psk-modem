@@ -1,383 +1,569 @@
 #include "psk_tx.h"
+#include "psk_codec.h"
 
 #include <math.h>
-#include <ctype.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-
-#include "audio_input.h"
-#include "board_config.h"
-#include "esp_check.h"
-#include "esp_log.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
-#include "freertos/task.h"
-#include "ft8/constants.h"
-#include "ft8/encode.h"
-#include "ft8/message.h"
-#include "rx_modem.h"
-#include "psk_modes.h"
-#include "PSKTables.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-#define TWO_PI_F 6.28318530717958647692f
-#define TX_QUEUE_DEPTH 4
-#define TX_WAVE_CHUNK 512
-#define TX_AMPLITUDE 11000
-
-static const char *TAG = "tx";
-static QueueHandle_t s_tx_queue;
-
-static const uint8_t s_baudot_letters[26] = {
-    0x03, 0x19, 0x0e, 0x09, 0x01, 0x0d, 0x1a, 0x14, 0x06, 0x0b, 0x0f, 0x12, 0x1c,
-    0x0c, 0x18, 0x16, 0x17, 0x0a, 0x05, 0x10, 0x07, 0x1e, 0x13, 0x1b, 0x15, 0x11,
+enum {
+    PSK_TX_STAGE_IDLE = 0,
+    PSK_TX_STAGE_PREAMBLE,
+    PSK_TX_STAGE_TEXT,
+    PSK_TX_STAGE_POSTAMBLE,
 };
 
-static const uint8_t s_baudot_figures[26] = {
-    0x03, 0x19, 0x0e, 0x09, 0x01, 0x0d, 0x1a, 0x14, 0x06, 0x0b, 0x0f, 0x12, 0x1c,
-    0x0c, 0x18, 0x16, 0x17, 0x0a, 0x05, 0x10, 0x07, 0x1e, 0x13, 0x1b, 0x15, 0x11,
-};
+static uint8_t s_tx_raw_bits[PSK_TX_BIT_MAX];
+static uint8_t s_tx_punctured_bits[PSK_TX_BIT_MAX];
+static uint8_t s_tx_interleave_table[2560];
 
-typedef struct {
-    const tx_request_t *request;
-    int16_t buffer[TX_WAVE_CHUNK];
-    size_t buffer_len;
-    float phase;
-} tx_synth_t;
+#define PSK_TX_DEFAULT_AMPLITUDE 26000
+#define PSK_TX_PEAK_LIMIT        30000.0f
 
-static void tx_flush(tx_synth_t *s)
+static uint16_t fec_8psk_flush_chars(psk_mode_t mode)
 {
-    if (s->buffer_len == 0) {
-        return;
-    }
-    (void)audio_output_write(s->buffer, s->buffer_len);
-    s->buffer_len = 0;
-}
-
-static void tx_push_sample(tx_synth_t *s, float sample)
-{
-    if (sample > 32767.0f) {
-        sample = 32767.0f;
-    } else if (sample < -32768.0f) {
-        sample = -32768.0f;
-    }
-    s->buffer[s->buffer_len++] = (int16_t)lrintf(sample);
-    if (s->buffer_len == TX_WAVE_CHUNK) {
-        tx_flush(s);
+    switch (mode) {
+    case PSK_MODE_8PSK125F:
+        return 55U;
+    case PSK_MODE_8PSK250F:
+        return 65U;
+    case PSK_MODE_8PSK500F:
+        return 80U;
+    case PSK_MODE_8PSK1000F:
+        return 120U;
+    case PSK_MODE_8PSK1200F:
+        return 175U;
+    default:
+        return 0U;
     }
 }
 
-static void tx_emit_silence(tx_synth_t *s, float seconds)
+static float wrap_phase(float phase)
 {
-    const int samples = (int)lrintf(seconds * (float)BOARD_CODEC_SAMPLE_RATE_HZ);
-    for (int i = 0; i < samples; ++i) {
-        tx_push_sample(s, 0.0f);
+    while (phase >= (float)(2.0 * M_PI)) {
+        phase -= (float)(2.0 * M_PI);
     }
+    while (phase < 0.0f) {
+        phase += (float)(2.0 * M_PI);
+    }
+    return phase;
 }
 
-static void tx_emit_tone(tx_synth_t *s, float freq_hz, float seconds, float phase_offset, float amplitude)
+static void set_symbol_transition(psk_tx_t *tx, uint8_t car, float target_phase)
 {
-    const int samples = (int)lrintf(seconds * (float)BOARD_CODEC_SAMPLE_RATE_HZ);
-    const float phase_inc = TWO_PI_F * freq_hz / (float)BOARD_CODEC_SAMPLE_RATE_HZ;
-    float phase = s->phase + phase_offset;
-    for (int i = 0; i < samples; ++i) {
-        tx_push_sample(s, sinf(phase) * amplitude);
-        phase += phase_inc;
-        if (phase > TWO_PI_F) {
-            phase -= TWO_PI_F;
+    const float start_phase = tx->data_phase[car];
+    target_phase = wrap_phase(target_phase);
+
+    tx->phase_start[car] = start_phase;
+    tx->phase_target[car] = target_phase;
+    tx->symbol_start_i[car] = cosf(start_phase);
+    tx->symbol_start_q[car] = sinf(start_phase);
+    tx->symbol_target_i[car] = cosf(target_phase);
+    tx->symbol_target_q[car] = sinf(target_phase);
+    tx->data_phase[car] = target_phase;
+}
+
+static void reset_tx(psk_tx_t *tx)
+{
+    memset(tx->payload_bits, 0, sizeof(tx->payload_bits));
+    memset(tx->symbol_bits, 0, sizeof(tx->symbol_bits));
+    memset(tx->carrier_phase, 0, sizeof(tx->carrier_phase));
+    memset(tx->carrier_step, 0, sizeof(tx->carrier_step));
+    memset(tx->data_phase, 0, sizeof(tx->data_phase));
+    memset(tx->phase_start, 0, sizeof(tx->phase_start));
+    memset(tx->phase_target, 0, sizeof(tx->phase_target));
+    memset(tx->symbol_start_i, 0, sizeof(tx->symbol_start_i));
+    memset(tx->symbol_start_q, 0, sizeof(tx->symbol_start_q));
+    memset(tx->symbol_target_i, 0, sizeof(tx->symbol_target_i));
+    memset(tx->symbol_target_q, 0, sizeof(tx->symbol_target_q));
+    tx->symbol_position = 0.0f;
+    tx->payload_len = 0U;
+    tx->payload_pos = 0U;
+    tx->active = 0U;
+    tx->stage = PSK_TX_STAGE_IDLE;
+    tx->repeat_payload = 0U;
+    tx->fec_flush_chars = 0U;
+    tx->fec_preamble_bits = 0U;
+    tx->fec_stream = 0U;
+    tx->fec_stream_out_len = 0U;
+    tx->fec_stream_out_pos = 0U;
+    tx->fec_stream_puncture_phase = 0U;
+    tx->fec_stream_warmup_bits_left = 0U;
+    tx->fec_stream_state = 0U;
+}
+
+static void load_mode(const psk_mode_info_t *info, psk_tx_t *tx, int32_t tone_hz)
+{
+    tx->family = (uint8_t)info->family;
+    tx->carriers = info->carriers ? info->carriers : 1U;
+    tx->bits_per_symbol = info->bits_per_symbol ? info->bits_per_symbol : 1U;
+    tx->fec = info->fec;
+    tx->punctured = info->punctured;
+    tx->mfsk_varicode = info->mfsk_varicode;
+    tx->dual_fec_branch = info->dual_fec_branch;
+    tx->fec_k = info->fec_k;
+    tx->interleave_depth = info->interleave_depth;
+    tx->fec_poly1 = info->fec_poly1;
+    tx->fec_poly2 = info->fec_poly2;
+    tx->fec_flush_chars = fec_8psk_flush_chars(info->id);
+    tx->fec_preamble_bits = 0U;
+    tx->tone_hz = tone_hz > 0 ? tone_hz : 1500;
+    tx->symbol_period_samples = (float)tx->sample_rate_hz / info->baud;
+    tx->symbol_samples = (uint32_t)(tx->symbol_period_samples + 0.5f);
+    if (tx->symbol_samples == 0U) {
+        tx->symbol_samples = 1U;
+    }
+    tx->amplitude_scale = (float)tx->amplitude;
+    if (tx->carriers > 1U) {
+        /* fldigi normalizes each multi-carrier symbol block after summing
+         * carriers. Use RMS-preserving scaling here: it keeps worst-case peaks
+         * below int16 while avoiding a 1/N per-carrier SNR loss on the board
+         * audio path. */
+        const float carriers = (float)tx->carriers;
+        tx->amplitude_scale /= sqrtf(carriers);
+        const float peak_limited_scale = PSK_TX_PEAK_LIMIT / carriers;
+        if (tx->amplitude_scale > peak_limited_scale) {
+            tx->amplitude_scale = peak_limited_scale;
         }
     }
-    s->phase = phase;
+
+    const float spacing = 1.4f * info->baud;
+    const float first = (float)tx->tone_hz + (((-1.0f * (float)tx->carriers) + 1.0f) * spacing * 0.5f);
+    for (uint8_t car = 0U; car < tx->carriers; ++car) {
+        const float freq = first + (float)car * spacing;
+        tx->carrier_step[car] = (float)(2.0 * M_PI * (double)freq / (double)tx->sample_rate_hz);
+        tx->carrier_phase[car] = 0.0f;
+        tx->data_phase[car] = 0.0f;
+        tx->phase_start[car] = 0.0f;
+        tx->phase_target[car] = 0.0f;
+        tx->symbol_start_i[car] = 1.0f;
+        tx->symbol_start_q[car] = 0.0f;
+        tx->symbol_target_i[car] = 1.0f;
+        tx->symbol_target_q[car] = 0.0f;
+    }
 }
 
-static size_t varicode_bits(uint8_t ch, uint8_t *bits, size_t max_bits)
+static size_t build_raw_payload_stream(psk_tx_t *tx, const char *text,
+                                       uint8_t append_fec_preamble,
+                                       uint8_t append_fec_flush)
 {
-    if (max_bits < 2) {
-        return 0;
+    size_t raw_len = 0U;
+    if (append_fec_preamble) {
+        for (uint16_t i = 0U; i < tx->fec_preamble_bits; ++i) {
+            psk_codec_append_bit(s_tx_raw_bits, &raw_len, 0U);
+        }
     }
-    const unsigned int code = VARICODE_TABLE[ch];
-    if (code == 0) {
-        bits[0] = 0;
-        bits[1] = 0;
-        return 2;
-    }
-
-    const int msb = 31 - __builtin_clz(code);
-    size_t count = 0;
-    for (int bit = msb; bit >= 0 && count < max_bits; --bit) {
-        bits[count++] = (code >> bit) & 1U;
-    }
-    if (count + 2 <= max_bits) {
-        bits[count++] = 0;
-        bits[count++] = 0;
-    }
-    return count;
-}
-
-static size_t build_varicode_stream(const char *text, uint8_t *bits, size_t max_bits)
-{
-    size_t count = 0;
-    if (!text) {
-        return 0;
-    }
-    for (const unsigned char *p = (const unsigned char *)text; *p && count + 8 < max_bits; ++p) {
-        count += varicode_bits(*p, &bits[count], max_bits - count);
-    }
-    return count;
-}
-
-static size_t bits_to_symbols(const uint8_t *bits, size_t bit_count, uint8_t bits_per_symbol,
-                              uint8_t *symbols, size_t max_symbols)
-{
-    size_t out = 0;
-    size_t pos = 0;
-    while (pos < bit_count && out < max_symbols) {
-        uint8_t sym = 0;
-        for (uint8_t i = 0; i < bits_per_symbol; ++i) {
-            sym <<= 1;
-            if (pos < bit_count) {
-                sym |= bits[pos++];
+    if (tx->mfsk_varicode) {
+        if (tx->family == PSK_MODE_FAMILY_8PSK) {
+            psk_codec_append_mfsk_char(s_tx_raw_bits, &raw_len, 0U);
+        }
+        psk_codec_append_mfsk_text(s_tx_raw_bits, &raw_len, text);
+        if (append_fec_flush && tx->family == PSK_MODE_FAMILY_8PSK && tx->fec) {
+            const uint16_t flush_chars = tx->fec_flush_chars ? tx->fec_flush_chars : 32U;
+            for (uint16_t i = 0U; i < flush_chars; ++i) {
+                psk_codec_append_mfsk_char(s_tx_raw_bits, &raw_len, 0U);
             }
         }
-        symbols[out++] = sym;
+    } else {
+        psk_codec_append_varicode_text(s_tx_raw_bits, &raw_len, text);
+    }
+
+    return raw_len;
+}
+
+static size_t build_encoded_payload_stream(psk_tx_t *tx, size_t raw_len)
+{
+    if (!tx->fec) {
+        memcpy(tx->payload_bits, s_tx_raw_bits, raw_len);
+        return raw_len;
+    }
+
+    size_t encoded_len = psk_codec_conv_encode_bits(tx->payload_bits, sizeof(tx->payload_bits),
+                                                    s_tx_raw_bits, raw_len, tx->fec_k,
+                                                    tx->fec_poly1, tx->fec_poly2);
+    if (encoded_len == 0U) {
+        return 0U;
+    }
+
+    if (tx->interleave_depth != 0U) {
+        size_t interleaved_len = 0U;
+        psk_codec_interleave2_reset(s_tx_interleave_table, sizeof(s_tx_interleave_table));
+        for (size_t i = 0U; i + 1U < encoded_len; i += 2U) {
+            uint8_t out_pair[2];
+            (void)psk_codec_interleave2_pair(s_tx_interleave_table, sizeof(s_tx_interleave_table),
+                                             tx->interleave_depth,
+                                             tx->payload_bits[i], tx->payload_bits[i + 1U],
+                                             out_pair);
+            if (interleaved_len + 2U > PSK_TX_BIT_MAX) {
+                return 0U;
+            }
+            s_tx_punctured_bits[interleaved_len++] = out_pair[0];
+            s_tx_punctured_bits[interleaved_len++] = out_pair[1];
+        }
+        memcpy(tx->payload_bits, s_tx_punctured_bits, interleaved_len);
+        encoded_len = interleaved_len;
+    }
+
+    if (tx->punctured && tx->family == PSK_MODE_FAMILY_8PSK) {
+        size_t punctured_len = 0U;
+        for (size_t i = 0U; i < encoded_len; ++i) {
+            if (((i + 1U) & 3U) == 0U) {
+                continue;
+            }
+            if (punctured_len < PSK_TX_BIT_MAX) {
+                s_tx_punctured_bits[punctured_len++] = tx->payload_bits[i] ? 1U : 0U;
+            }
+        }
+        memcpy(tx->payload_bits, s_tx_punctured_bits, punctured_len);
+        encoded_len = punctured_len;
+    }
+
+    return encoded_len;
+}
+
+static size_t build_payload_stream(psk_tx_t *tx, uint8_t repeat_payload)
+{
+    const char *text = tx->text;
+
+    const uint8_t append_fec_preamble = (uint8_t)(tx->fec_preamble_bits != 0U && !repeat_payload);
+    const size_t raw_len = build_raw_payload_stream(tx, text, append_fec_preamble,
+                                                    (uint8_t)(tx->fec && !repeat_payload));
+    if (raw_len == 0U) {
+        return 0U;
+    }
+
+    if (tx->fec && repeat_payload) {
+        memcpy(tx->payload_bits, s_tx_raw_bits, raw_len);
+        tx->fec_stream = 1U;
+        tx->fec_stream_state = 0U;
+        tx->fec_stream_out_len = 0U;
+        tx->fec_stream_out_pos = 0U;
+        tx->fec_stream_puncture_phase = 0U;
+        tx->fec_stream_warmup_bits_left = tx->fec_preamble_bits;
+        psk_codec_interleave2_reset(s_tx_interleave_table, sizeof(s_tx_interleave_table));
+        return raw_len;
+    }
+
+    return build_encoded_payload_stream(tx, raw_len);
+}
+
+static uint8_t take_raw_payload_bit(psk_tx_t *tx, uint8_t *bit)
+{
+    if (tx->fec_stream_warmup_bits_left > 0U) {
+        --tx->fec_stream_warmup_bits_left;
+        *bit = 0U;
+        return 1U;
+    }
+    if (tx->payload_pos >= tx->payload_len) {
+        if (!tx->repeat_payload || tx->payload_len == 0U) {
+            return 0U;
+        }
+        tx->payload_pos = 0U;
+    }
+    *bit = tx->payload_bits[tx->payload_pos++] ? 1U : 0U;
+    return 1U;
+}
+
+static uint8_t queue_fec_stream_bit(psk_tx_t *tx, uint8_t bit)
+{
+    if (tx->punctured && tx->family == PSK_MODE_FAMILY_8PSK) {
+        tx->fec_stream_puncture_phase = (uint8_t)((tx->fec_stream_puncture_phase + 1U) & 3U);
+        if (tx->fec_stream_puncture_phase == 0U) {
+            return 1U;
+        }
+    }
+    if (tx->fec_stream_out_len >= sizeof(tx->fec_stream_out)) {
+        return 0U;
+    }
+    tx->fec_stream_out[tx->fec_stream_out_len++] = bit ? 1U : 0U;
+    return 1U;
+}
+
+static uint8_t fill_fec_stream_queue(psk_tx_t *tx)
+{
+    uint8_t raw_bit = 0U;
+    if (!take_raw_payload_bit(tx, &raw_bit)) {
+        return 0U;
+    }
+
+    uint8_t encoded_pair[2];
+    if (!psk_codec_conv_encode_bit(&tx->fec_stream_state, raw_bit, tx->fec_k,
+                                   tx->fec_poly1, tx->fec_poly2, encoded_pair)) {
+        return 0U;
+    }
+    if (tx->interleave_depth != 0U) {
+        uint8_t interleaved_pair[2];
+        if (!psk_codec_interleave2_pair(s_tx_interleave_table, sizeof(s_tx_interleave_table),
+                                        tx->interleave_depth,
+                                        encoded_pair[0], encoded_pair[1], interleaved_pair)) {
+            return 0U;
+        }
+        encoded_pair[0] = interleaved_pair[0];
+        encoded_pair[1] = interleaved_pair[1];
+    }
+
+    return queue_fec_stream_bit(tx, encoded_pair[0]) &&
+           queue_fec_stream_bit(tx, encoded_pair[1]);
+}
+
+static uint8_t take_fec_stream_bit(psk_tx_t *tx, uint8_t *bit)
+{
+    while (tx->fec_stream_out_pos >= tx->fec_stream_out_len) {
+        tx->fec_stream_out_pos = 0U;
+        tx->fec_stream_out_len = 0U;
+        if (!fill_fec_stream_queue(tx)) {
+            return 0U;
+        }
+    }
+
+    *bit = tx->fec_stream_out[tx->fec_stream_out_pos++] ? 1U : 0U;
+    return 1U;
+}
+
+static uint8_t take_payload_bit(psk_tx_t *tx, uint8_t *bit)
+{
+    if (tx->fec_stream) {
+        return take_fec_stream_bit(tx, bit);
+    }
+    if (tx->payload_pos >= tx->payload_len) {
+        if (!tx->repeat_payload || tx->payload_len == 0U) {
+            return 0U;
+        }
+        tx->payload_pos = 0U;
+    }
+    *bit = tx->payload_bits[tx->payload_pos++] ? 1U : 0U;
+    return 1U;
+}
+
+static uint8_t bits_to_symbol(const psk_tx_t *tx, const uint8_t *bits, uint8_t count)
+{
+    (void)tx;
+    uint8_t out = 0U;
+    for (uint8_t i = 0U; i < count; ++i) {
+        out = (uint8_t)(out | ((bits[i] ? 1U : 0U) << i));
     }
     return out;
 }
 
-static void emit_psk_symbols(tx_synth_t *s, const psk_mode_info_t *info, const uint8_t *symbols,
-                             size_t symbol_count)
+static uint8_t load_symbol(psk_tx_t *tx, uint8_t *values, uint8_t *count)
 {
-    const float baud = info->baud > 0.0f ? info->baud : 31.25f;
-    const float symbol_seconds = 1.0f / baud;
-    const float carrier_spacing = baud;
-    const int carriers = info->carriers > 0 ? info->carriers : 1;
-    const float base_freq = (float)1000 + (float)(s->request->tone_hz - 1000);
-
-    for (size_t i = 0; i < symbol_count; ++i) {
-        const uint8_t sym = symbols[i];
-        float phase_step = 0.0f;
-        if (info->bits_per_symbol == 1) {
-            phase_step = sym ? 0.0f : (float)M_PI;
-        } else {
-            const uint8_t phase_levels = 1U << info->bits_per_symbol;
-            phase_step = TWO_PI_F * (float)(sym % phase_levels) / (float)phase_levels;
-        }
-
-        const int samples = (int)lrintf(symbol_seconds * (float)BOARD_CODEC_SAMPLE_RATE_HZ);
-        for (int n = 0; n < samples; ++n) {
-            float mix = 0.0f;
-            for (int c = 0; c < carriers; ++c) {
-                const float offset = ((float)c - ((float)carriers - 1.0f) * 0.5f) * carrier_spacing;
-                const float phase = s->phase + phase_step + TWO_PI_F * (base_freq + offset) * (float)n /
-                                                     (float)BOARD_CODEC_SAMPLE_RATE_HZ;
-                mix += sinf(phase);
+    *count = 0U;
+    if (tx->stage == PSK_TX_STAGE_PREAMBLE) {
+        if (tx->preamble_left > 0U) {
+            --tx->preamble_left;
+            if (tx->fec && tx->family == PSK_MODE_FAMILY_8PSK) {
+                /* fldigi disables FEC for the first half of the 8PSK FEC
+                 * preamble and sends non-FEC symbol 0. With this Gray map,
+                 * symbol 6 produces the same 180 degree differential phase. */
+                values[0] = 0U;
+                values[1] = 1U;
+                values[2] = 1U;
+                *count = tx->bits_per_symbol;
+                return 1U;
             }
-            tx_push_sample(s, (mix / (float)carriers) * TX_AMPLITUDE);
+            for (uint8_t i = 0U; i < tx->carriers; ++i) {
+                values[i] = 0U;
+            }
+            *count = tx->carriers;
+            return 1U;
         }
-        s->phase += phase_step;
-        while (s->phase > TWO_PI_F) {
-            s->phase -= TWO_PI_F;
-        }
+        tx->stage = PSK_TX_STAGE_TEXT;
     }
-}
 
-static void tx_send_psk(tx_synth_t *s)
-{
-    const psk_mode_info_t *info = psk_mode_info(s->request->psk_mode);
-    uint8_t bits[2048];
-    uint8_t symbols[1024];
-    const size_t bit_count = build_varicode_stream(s->request->text, bits, sizeof(bits));
-    const size_t symbol_count = bits_to_symbols(bits, bit_count, info->bits_per_symbol, symbols, sizeof(symbols));
-    tx_emit_tone(s, (float)s->request->tone_hz, 0.15f, 0.0f, TX_AMPLITUDE * 0.5f);
-    emit_psk_symbols(s, info, symbols, symbol_count);
-    tx_emit_tone(s, (float)s->request->tone_hz, 0.05f, 0.0f, TX_AMPLITUDE * 0.5f);
-}
-
-static void tx_send_cw(tx_synth_t *s)
-{
-    static const struct {
-        char ch;
-        const char *morse;
-    } table[] = {
-        {'A', ".-"}, {'B', "-..."}, {'C', "-.-."}, {'D', "-.."}, {'E', "."},
-        {'F', "..-."}, {'G', "--."}, {'H', "...."}, {'I', ".."}, {'J', ".---"},
-        {'K', "-.-"}, {'L', ".-.."}, {'M', "--"}, {'N', "-."}, {'O', "---"},
-        {'P', ".--."}, {'Q', "--.-"}, {'R', ".-."}, {'S', "..."}, {'T', "-"},
-        {'U', "..-"}, {'V', "...-"}, {'W', ".--"}, {'X', "-..-"}, {'Y', "-.--"},
-        {'Z', "--.."}, {'1', ".----"}, {'2', "..---"}, {'3', "...--"},
-        {'4', "....-"}, {'5', "....."}, {'6', "-...."}, {'7', "--..."},
-        {'8', "---.."}, {'9', "----."}, {'0', "-----"},
-    };
-    const float wpm = 18.0f;
-    const float unit = 1.2f / wpm;
-    for (const char *p = s->request->text; *p; ++p) {
-        if (*p == ' ') {
-            tx_emit_silence(s, unit * 7.0f);
-            continue;
+    if (tx->stage == PSK_TX_STAGE_TEXT) {
+        if (tx->family == PSK_MODE_FAMILY_BPSK && tx->carriers > 1U) {
+            for (uint8_t i = 0U; i < tx->carriers; ++i) {
+                uint8_t bit = 0U;
+                if (!take_payload_bit(tx, &bit)) {
+                    tx->stage = PSK_TX_STAGE_POSTAMBLE;
+                    return load_symbol(tx, values, count);
+                }
+                values[i] = bit;
+            }
+            *count = tx->carriers;
+            return 1U;
         }
-        char up = (char)toupper((unsigned char)*p);
-        const char *morse = NULL;
-        for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); ++i) {
-            if (table[i].ch == up) {
-                morse = table[i].morse;
+
+        const uint8_t bits_needed = tx->bits_per_symbol;
+        for (uint8_t i = 0U; i < bits_needed; ++i) {
+            uint8_t bit = 0U;
+            if (!take_payload_bit(tx, &bit)) {
+                tx->stage = PSK_TX_STAGE_POSTAMBLE;
+                return load_symbol(tx, values, count);
+            }
+            values[i] = bit;
+        }
+        *count = bits_needed;
+        return 1U;
+    }
+
+    if (tx->stage == PSK_TX_STAGE_POSTAMBLE) {
+        if (tx->postamble_left > 0U) {
+            --tx->postamble_left;
+            if (tx->family == PSK_MODE_FAMILY_8PSK) {
+                const uint8_t idle_symbol = tx->fec ? 0U : 4U;
+                for (uint8_t i = 0U; i < tx->bits_per_symbol; ++i) {
+                    values[i] = (uint8_t)((idle_symbol >> i) & 1U);
+                }
+                *count = tx->bits_per_symbol;
+                return 1U;
+            } else {
+                for (uint8_t i = 0U; i < tx->carriers; ++i) {
+                    values[i] = 1U;
+                }
+                *count = tx->carriers;
+                return 1U;
+            }
+        }
+        tx->stage = PSK_TX_STAGE_IDLE;
+        tx->active = 0U;
+        return 0U;
+    }
+
+    return 0U;
+}
+
+void psk_tx_init(psk_tx_t *tx, uint32_t sample_rate_hz)
+{
+    if (!tx) {
+        return;
+    }
+    memset(tx, 0, sizeof(*tx));
+    tx->sample_rate_hz = sample_rate_hz;
+    tx->tone_hz = 1500;
+    tx->symbol_samples = sample_rate_hz / 31U;
+    if (tx->symbol_samples == 0U) {
+        tx->symbol_samples = 1U;
+    }
+    tx->symbol_period_samples = (float)tx->symbol_samples;
+    tx->symbol_position = 0.0f;
+    tx->amplitude = PSK_TX_DEFAULT_AMPLITUDE;
+}
+
+static int start_text(psk_tx_t *tx, psk_mode_t mode, int32_t tone_hz,
+                      const char *text, uint8_t repeat_payload)
+{
+    if (!tx || !text || *text == '\0') {
+        return -1;
+    }
+
+    const psk_mode_info_t *info = psk_mode_info(mode);
+    if (!info || info->baud <= 0.0f || info->bits_per_symbol == 0U || info->carriers == 0U) {
+        return -2;
+    }
+
+    reset_tx(tx);
+    strncpy(tx->text, text, sizeof(tx->text) - 1U);
+    tx->text_len = strlen(tx->text);
+    load_mode(info, tx, tone_hz);
+    tx->preamble_symbols = info->dcd_bits ? info->dcd_bits : 32U;
+    if (tx->fec && tx->family == PSK_MODE_FAMILY_8PSK) {
+        tx->fec_preamble_bits = tx->preamble_symbols;
+        tx->preamble_symbols /= 2U;
+    }
+    tx->postamble_symbols = (tx->fec && tx->family == PSK_MODE_FAMILY_8PSK) ?
+        0U : tx->preamble_symbols;
+    tx->repeat_payload = repeat_payload ? 1U : 0U;
+
+    const size_t payload_len = build_payload_stream(tx, repeat_payload);
+    if (payload_len == 0U) {
+        return -3;
+    }
+    tx->payload_len = payload_len;
+    tx->payload_pos = 0U;
+    tx->preamble_left = tx->preamble_symbols;
+    tx->postamble_left = tx->postamble_symbols;
+    tx->stage = PSK_TX_STAGE_PREAMBLE;
+    tx->active = 1U;
+    tx->symbol_position = tx->symbol_period_samples;
+    return 0;
+}
+
+int psk_tx_start_text(psk_tx_t *tx, psk_mode_t mode, int32_t tone_hz, const char *text)
+{
+    return start_text(tx, mode, tone_hz, text, 0U);
+}
+
+int psk_tx_start_text_loop(psk_tx_t *tx, psk_mode_t mode, int32_t tone_hz,
+                           const char *text)
+{
+    return start_text(tx, mode, tone_hz, text, 1U);
+}
+
+size_t psk_tx_generate(psk_tx_t *tx, int16_t *out, size_t capacity)
+{
+    if (!tx || !out || capacity == 0U || !tx->active) {
+        return 0U;
+    }
+
+    size_t produced = 0U;
+    while (produced < capacity && tx->active) {
+        if (tx->symbol_position >= tx->symbol_period_samples) {
+            uint8_t bits[PSK_TX_CARRIER_MAX] = {0};
+            uint8_t count = 0U;
+            if (!load_symbol(tx, bits, &count)) {
                 break;
             }
+            tx->symbol_position -= tx->symbol_period_samples;
+
+            if (tx->family == PSK_MODE_FAMILY_BPSK && tx->carriers > 1U) {
+                for (uint8_t car = 0U; car < tx->carriers; ++car) {
+                    float target_phase = tx->data_phase[car];
+                    if (bits[car] == 0U) {
+                        target_phase += (float)M_PI;
+                    }
+                    set_symbol_transition(tx, car, target_phase);
+                }
+            } else {
+                const uint8_t symbol = bits_to_symbol(tx, bits, count);
+                const float phase_delta = psk_codec_phase_delta((psk_mode_family_t)tx->family,
+                                                               tx->fec, symbol);
+                set_symbol_transition(tx, 0U, tx->data_phase[0] + phase_delta);
+            }
         }
-        if (!morse) {
-            continue;
+
+        const float x = tx->symbol_period_samples > 0.0f ?
+            tx->symbol_position / tx->symbol_period_samples : 0.0f;
+        const float shape_b = 0.5f - 0.5f * cosf((float)M_PI * x);
+        const float shape_a = 1.0f - shape_b;
+        float sample = 0.0f;
+        const uint8_t active = tx->carriers ? tx->carriers : 1U;
+        for (uint8_t car = 0U; car < active; ++car) {
+            const float i = shape_a * tx->symbol_start_i[car] +
+                            shape_b * tx->symbol_target_i[car];
+            const float q = shape_a * tx->symbol_start_q[car] +
+                            shape_b * tx->symbol_target_q[car];
+            const float carrier_cos = cosf(tx->carrier_phase[car]);
+            const float carrier_sin = sinf(tx->carrier_phase[car]);
+            sample += i * carrier_cos + q * carrier_sin;
+            tx->carrier_phase[car] += tx->carrier_step[car];
+            if (tx->carrier_phase[car] >= (float)(2.0 * M_PI)) {
+                tx->carrier_phase[car] -= (float)(2.0 * M_PI);
+            }
         }
-        for (const char *m = morse; *m; ++m) {
-            tx_emit_tone(s, (float)s->request->tone_hz, *m == '.' ? unit : unit * 3.0f, 0.0f, TX_AMPLITUDE * 0.5f);
-            tx_emit_silence(s, unit);
+        float scaled = sample * tx->amplitude_scale;
+        if (scaled > 32767.0f) {
+            scaled = 32767.0f;
+        } else if (scaled < -32768.0f) {
+            scaled = -32768.0f;
         }
-        tx_emit_silence(s, unit * 2.0f);
+        out[produced++] = (int16_t)scaled;
+        tx->symbol_position += 1.0f;
     }
+
+    return produced;
 }
 
-static uint8_t rtty_code_for_char(char ch, int *figures)
+int psk_tx_active(const psk_tx_t *tx)
 {
-    if (ch == ' ') {
-        return 0x04;
-    }
-    if (ch >= 'A' && ch <= 'Z') {
-        *figures = 0;
-        return s_baudot_letters[ch - 'A'];
-    }
-    if (ch >= 'a' && ch <= 'z') {
-        *figures = 0;
-        return s_baudot_letters[ch - 'a'];
-    }
-    if (ch >= '0' && ch <= '9') {
-        *figures = 1;
-        return s_baudot_figures[ch - '0'];
-    }
-    *figures = 0;
-    return 0x04;
+    return tx && tx->active;
 }
 
-static void tx_send_rtty(tx_synth_t *s)
+void psk_tx_stop(psk_tx_t *tx)
 {
-    const float baud = 45.45f;
-    const float bit_seconds = 1.0f / baud;
-    int figures = 0;
-    for (const char *p = s->request->text; *p; ++p) {
-        const uint8_t code = rtty_code_for_char(*p, &figures);
-        tx_emit_silence(s, bit_seconds);
-        tx_emit_tone(s, (float)(s->request->tone_hz - 85), bit_seconds, 0.0f, TX_AMPLITUDE * 0.45f);
-        for (int bit = 0; bit < 5; ++bit) {
-            const int v = (code >> bit) & 1;
-            tx_emit_tone(s, (float)(s->request->tone_hz + (v ? 85 : -85)), bit_seconds, 0.0f, TX_AMPLITUDE * 0.45f);
-        }
-        tx_emit_tone(s, (float)(s->request->tone_hz + 85), bit_seconds * 2.0f, 0.0f, TX_AMPLITUDE * 0.45f);
-    }
-}
-
-static void tx_send_ftx(tx_synth_t *s, int ft4)
-{
-    ftx_message_t msg;
-    memset(&msg, 0, sizeof(msg));
-    static const ftx_callsign_hash_interface_t hash_if = { 0 };
-    if (ftx_message_encode(&msg, (ftx_callsign_hash_interface_t *)&hash_if, s->request->text) != FTX_MESSAGE_RC_OK) {
-        (void)ftx_message_encode_free(&msg, s->request->text);
-    }
-
-    uint8_t tones[FT8_NN > FT4_NN ? FT8_NN : FT4_NN];
-    if (ft4) {
-        ft4_encode(msg.payload, tones);
-    } else {
-        ft8_encode(msg.payload, tones);
-    }
-
-    const float sym_seconds = ft4 ? 0.06f : 0.16f;
-    const float tone_step = ft4 ? 6.25f : 6.25f;
-    const float base = (float)s->request->tone_hz;
-    tx_emit_silence(s, 0.5f);
-    for (int i = 0; i < (ft4 ? FT4_NN : FT8_NN); ++i) {
-        const float freq = base + (float)tones[i] * tone_step;
-        tx_emit_tone(s, freq, sym_seconds, 0.0f, TX_AMPLITUDE * 0.42f);
-    }
-    tx_emit_silence(s, 0.25f);
-}
-
-static void tx_send_mfsk16(tx_synth_t *s)
-{
-    uint8_t bits[2048];
-    uint8_t symbols[1024];
-    const size_t bit_count = build_varicode_stream(s->request->text, bits, sizeof(bits));
-    const size_t symbol_count = bits_to_symbols(bits, bit_count, 4, symbols, sizeof(symbols));
-    tx_emit_silence(s, 0.15f);
-    for (size_t i = 0; i < symbol_count; ++i) {
-        const float freq = (float)s->request->tone_hz + ((float)(symbols[i] & 0x0fU) - 7.5f) * 20.0f;
-        tx_emit_tone(s, freq, 1.0f / 15.625f, 0.0f, TX_AMPLITUDE * 0.42f);
-    }
-    tx_emit_silence(s, 0.05f);
-}
-
-static void tx_send_request(const tx_request_t *request)
-{
-    tx_synth_t s = {
-        .request = request,
-        .buffer_len = 0,
-        .phase = 0.0f,
-    };
-    const psk_mode_info_t *info = psk_mode_info(request->psk_mode);
-
-    ESP_LOGI(TAG, "tx start mode=%s psk=%s text=%s", modem_mode_name(request->mode),
-             info->name, request->text);
-
-    switch (request->mode) {
-    case MODEM_MODE_BPSK31:
-    case MODEM_MODE_PSK63:
-        tx_send_psk(&s);
-        break;
-    case MODEM_MODE_FT8:
-        tx_send_ftx(&s, 0);
-        break;
-    case MODEM_MODE_FT4:
-        tx_send_ftx(&s, 1);
-        break;
-    case MODEM_MODE_RTTY:
-        tx_send_rtty(&s);
-        break;
-    case MODEM_MODE_CW:
-        tx_send_cw(&s);
-        break;
-    case MODEM_MODE_MFSK16:
-        tx_send_mfsk16(&s);
-        break;
-    default:
-        tx_send_psk(&s);
-        break;
-    }
-    tx_flush(&s);
-}
-
-esp_err_t tx_init(void)
-{
-    s_tx_queue = xQueueCreate(TX_QUEUE_DEPTH, sizeof(tx_request_t));
-    return s_tx_queue ? ESP_OK : ESP_ERR_NO_MEM;
-}
-
-esp_err_t tx_submit(const tx_request_t *request)
-{
-    if (!request || !s_tx_queue) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    return xQueueSend(s_tx_queue, request, 0) == pdTRUE ? ESP_OK : ESP_ERR_NO_MEM;
-}
-
-void tx_task(void *arg)
-{
-    (void)arg;
-    tx_request_t request;
-    ESP_LOGI(TAG, "tx task started");
-    while (true) {
-        if (xQueueReceive(s_tx_queue, &request, portMAX_DELAY) == pdTRUE) {
-            tx_send_request(&request);
-        }
+    if (tx) {
+        reset_tx(tx);
     }
 }

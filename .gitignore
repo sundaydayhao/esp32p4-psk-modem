@@ -24,6 +24,9 @@ Desktop.ini
 *.elf
 *.bin
 *.map
+tools/hw-logs-*/
+tools/spectrum-*/
+tools/captures/*.wav
 
 
 .magic-lamp-cache/

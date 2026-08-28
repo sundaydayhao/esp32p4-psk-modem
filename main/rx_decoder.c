@@ -291,11 +291,6 @@ static void mfsk16_deinterleave(decoder_layer_t *d, uint8_t soft[MFSK16_SYMBITS]
     }
 }
 
-static psk_rtty_mode_t to_psk_rtty_mode(psk_mode_t mode)
-{
-    return psk_mode_info(mode)->backend_mode;
-}
-
 static void on_psk_rtty_char(char c, void *userdata)
 {
     decoder_layer_t *d = (decoder_layer_t *)userdata;
@@ -351,8 +346,21 @@ static void recreate_backend(decoder_layer_t *d)
     d->profile = demod_profile_for_mode(d->config.mode);
     reset_symbol_state(d);
 
+    if (d->profile->family == DEMOD_FAMILY_PSK) {
+        psk_rx_config_t config = {
+            .mode = d->config.psk_mode,
+            .sample_rate_hz = d->config.sample_rate_hz,
+            .rx_tone_hz = d->config.rx_tone_hz,
+            .squelch = d->config.squelch,
+            .afc_enabled = 1,
+            .squelch_enabled = 1,
+        };
+        psk_rx_init(&d->psk_rx, &config);
+        return;
+    }
+
     psk_rtty_config_t config = {
-        .mode = d->profile->family == DEMOD_FAMILY_FSK ? PSK_RTTY_MODE_RTTY : to_psk_rtty_mode(d->config.psk_mode),
+        .mode = PSK_RTTY_MODE_RTTY,
         .sample_rate_hz = d->config.sample_rate_hz,
         .rx_tone_hz = d->config.rx_tone_hz,
         .char_cb = on_psk_rtty_char,
@@ -621,7 +629,13 @@ void decoder_layer_feed(decoder_layer_t *d, const int16_t *samples, size_t count
     }
 
     switch (d->profile->family) {
-    case DEMOD_FAMILY_PSK:
+    case DEMOD_FAMILY_PSK: {
+        char decoded[96];
+        const size_t decoded_len = psk_rx_process(&d->psk_rx, samples, count,
+                                                  decoded, sizeof(decoded));
+        emit_bytes(d, (const uint8_t *)decoded, decoded_len);
+        break;
+    }
     case DEMOD_FAMILY_FSK:
         psk_rtty_rx_feed(&d->psk_rtty_rx, samples, count);
         break;

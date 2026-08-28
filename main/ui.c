@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "audio_input.h"
 #include "board_config.h"
@@ -14,9 +15,12 @@
 
 static const char *TAG = "ui";
 static int s_last_sw1 = 1;
-static char s_serial_cmd[32];
+static char s_serial_cmd[320];
 static size_t s_serial_cmd_len;
 static int s_dump_pending;
+
+#define UI_TX_TEXT_DEFAULT \
+    "CQ CQ CQ DE HPM6750 PSK MODEM. THIS IS A CONTINUOUS BOARD TO BOARD AUDIO LINK TEST AT 1500 HZ. COPY THE QUICK BROWN FOX 0123456789.\n"
 
 typedef enum {
     UI_CYCLE_KIND_PSK,
@@ -30,6 +34,11 @@ typedef struct {
         modem_mode_t modem_mode;
     } value;
 } ui_cycle_item_t;
+
+typedef struct {
+    const char *label;
+    const char *text;
+} tx_text_preset_t;
 
 static const ui_cycle_item_t s_mode_cycle[] = {
     { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_BPSK31 } },
@@ -59,11 +68,25 @@ static const ui_cycle_item_t s_mode_cycle[] = {
     { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_8PSK500F } },
     { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_8PSK1000F } },
     { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_8PSK1200F } },
-    { UI_CYCLE_KIND_MODE, { .modem_mode = MODEM_MODE_FT8 } },
-    { UI_CYCLE_KIND_MODE, { .modem_mode = MODEM_MODE_FT4 } },
-    { UI_CYCLE_KIND_MODE, { .modem_mode = MODEM_MODE_RTTY } },
-    { UI_CYCLE_KIND_MODE, { .modem_mode = MODEM_MODE_CW } },
-    { UI_CYCLE_KIND_MODE, { .modem_mode = MODEM_MODE_MFSK16 } },
+};
+
+static const tx_text_preset_t s_tx_text_presets[] = {
+    {
+        "CQ",
+        UI_TX_TEXT_DEFAULT,
+    },
+    {
+        "BER",
+        "BER TEST FRAME HPM6750: ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789. PACKETS SHOULD REPEAT WITHOUT A NEW SYNC WHILE TX STAYS ACTIVE. END\n",
+    },
+    {
+        "ASCII",
+        "ASCII COPY TEST: abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789 .,:;+-*/=_? HPM6750 PSK AUDIO LINK TEXT SELECTOR\n",
+    },
+    {
+        "LOOP",
+        "LONG LOOP MESSAGE: HPM6750 DUAL BOARD PSK TEXT SELECTOR IS RUNNING. AUDIO RATE IS FIXED AT 48 KHZ. MODE CHANGES SEND NEW SYNC; TEXT LOOPS CONTINUOUSLY\n",
+    },
 };
 
 static int cycle_item_matches(const display_state_t *state, const ui_cycle_item_t *item)
@@ -127,7 +150,47 @@ static int cmd_starts(const char *text, const char *keyword)
         text++;
         keyword++;
     }
-    return *text == '\0' || *text == ' ' || *text == '\t';
+    return *text == '\0' || *text == ' ' || *text == '\t' || *text == '=' || *text == ':';
+}
+
+static const char *skip_command_arg(const char *text, const char *keyword)
+{
+    text += strlen(keyword);
+    text = skip_spaces(text);
+    if (*text == '=' || *text == ':') {
+        text++;
+    }
+    return skip_spaces(text);
+}
+
+static int parse_psk_mode_name(const char *name, psk_mode_t *mode)
+{
+    for (size_t i = 0; i < psk_mode_count(); ++i) {
+        const psk_mode_info_t *info = psk_mode_info_at(i);
+        if (info && cmd_equals(name, info->name)) {
+            *mode = info->id;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int parse_uint_arg(const char *text, unsigned *value)
+{
+    if (!text || *text == '\0') {
+        return 0;
+    }
+    unsigned result = 0U;
+    for (const char *p = text; *p != '\0'; ++p) {
+        if (*p < '0' || *p > '9') {
+            return 0;
+        }
+        result = result * 10U + (unsigned)(*p - '0');
+    }
+    if (value) {
+        *value = result;
+    }
+    return 1;
 }
 
 static void print_capture_dump(void)
@@ -193,59 +256,24 @@ static int parse_serial_mode_command(const char *cmd, ui_event_t *event)
     while (*cmd == ' ' || *cmd == '\t') {
         cmd++;
     }
-    if ((toupper((unsigned char)cmd[0]) == 'M') &&
-        (toupper((unsigned char)cmd[1]) == 'O') &&
-        (toupper((unsigned char)cmd[2]) == 'D') &&
-        (toupper((unsigned char)cmd[3]) == 'E') &&
-        (cmd[4] == ' ' || cmd[4] == '\t')) {
-        cmd += 5;
-        while (*cmd == ' ' || *cmd == '\t') {
-            cmd++;
-        }
+    if (cmd_starts(cmd, "RXMODE")) {
+        cmd = skip_command_arg(cmd, "RXMODE");
+    } else if (cmd_starts(cmd, "MODE")) {
+        cmd = skip_command_arg(cmd, "MODE");
     }
 
-    for (size_t i = 0; i < psk_mode_count(); ++i) {
-        const psk_mode_info_t *info = psk_mode_info_at(i);
-        if (!info) {
-            continue;
-        }
-        if (cmd_equals(cmd, info->name)) {
-            event->type = UI_EVENT_PSK_MODE_CHANGED;
-            event->psk_mode = info->id;
-            return 1;
-        }
-    }
-
-    if (cmd_equals(cmd, "FT8")) {
-        event->type = UI_EVENT_MODE_CHANGED;
-        event->mode = MODEM_MODE_FT8;
-        return 1;
-    }
-    if (cmd_equals(cmd, "FT4")) {
-        event->type = UI_EVENT_MODE_CHANGED;
-        event->mode = MODEM_MODE_FT4;
-        return 1;
-    }
-    if (cmd_equals(cmd, "RTTY")) {
-        event->type = UI_EVENT_MODE_CHANGED;
-        event->mode = MODEM_MODE_RTTY;
-        return 1;
-    }
-    if (cmd_equals(cmd, "CW")) {
-        event->type = UI_EVENT_MODE_CHANGED;
-        event->mode = MODEM_MODE_CW;
-        return 1;
-    }
-    if (cmd_equals(cmd, "MFSK16")) {
-        event->type = UI_EVENT_MODE_CHANGED;
-        event->mode = MODEM_MODE_MFSK16;
+    psk_mode_t psk_mode;
+    if (parse_psk_mode_name(cmd, &psk_mode)) {
+        event->type = UI_EVENT_PSK_MODE_CHANGED;
+        event->psk_mode = psk_mode;
         return 1;
     }
 
     return 0;
 }
 
-static int parse_serial_tx_command(const char *cmd, const display_state_t *display_state, ui_event_t *event)
+static int parse_serial_control_command(const char *cmd, const display_state_t *display_state,
+                                        ui_event_t *event)
 {
     while (*cmd == ' ' || *cmd == '\t') {
         cmd++;
@@ -253,25 +281,160 @@ static int parse_serial_tx_command(const char *cmd, const display_state_t *displ
     if (*cmd == '@') {
         cmd++;
     }
-    while (*cmd == ' ' || *cmd == '\t') {
-        cmd++;
-    }
-    if (!cmd_starts(cmd, "TX")) {
-        return 0;
-    }
-    cmd += 2;
     cmd = skip_spaces(cmd);
-    if (*cmd == '\0') {
-        cmd = "CQ CQ TEST";
+
+    if (cmd_starts(cmd, "ROLE")) {
+        const char *arg = skip_command_arg(cmd, "ROLE");
+        if (cmd_equals(arg, "TX")) {
+            event->type = UI_EVENT_DISPLAY_ROLE_CHANGED;
+            event->display_role = 1;
+            return 1;
+        }
+        if (cmd_equals(arg, "RX")) {
+            event->type = UI_EVENT_DISPLAY_ROLE_CHANGED;
+            event->display_role = 0;
+            return 1;
+        }
+        printf("[cmd] error role must be TX or RX\r\n");
+        return 1;
     }
 
-    event->type = UI_EVENT_TX_REQUEST;
-    event->tx_request.mode = display_state->selected_mode;
-    event->tx_request.psk_mode = display_state->selected_psk_mode;
-    event->tx_request.tone_hz = display_state->rx_tone_hz;
-    strncpy(event->tx_request.text, cmd, sizeof(event->tx_request.text) - 1);
-    event->tx_request.text[sizeof(event->tx_request.text) - 1] = '\0';
-    return 1;
+    if (cmd_starts(cmd, "TXMODE")) {
+        const char *arg = skip_command_arg(cmd, "TXMODE");
+        psk_mode_t mode;
+        if (parse_psk_mode_name(arg, &mode)) {
+            event->type = UI_EVENT_TX_MODE_CHANGED;
+            event->tx_psk_mode = mode;
+            return 1;
+        }
+        printf("[cmd] error unknown tx mode '%s'\r\n", arg);
+        return 1;
+    }
+
+    if (cmd_starts(cmd, "TONE")) {
+        const char *arg = skip_command_arg(cmd, "TONE");
+        char *end = NULL;
+        long tone_hz = strtol(arg, &end, 0);
+        if (end == arg) {
+            printf("[cmd] error tone must be: TONE <100..3500>\r\n");
+            return 1;
+        }
+        if (tone_hz < 100) {
+            tone_hz = 100;
+        } else if (tone_hz > 3500) {
+            tone_hz = 3500;
+        }
+        event->type = UI_EVENT_TONE_CHANGED;
+        event->tone_hz = (int)tone_hz;
+        printf("[tone] selected %dHz\r\n", event->tone_hz);
+        return 1;
+    }
+
+    if (cmd_starts(cmd, "TXSTOP") || cmd_equals(cmd, "STOP")) {
+        event->type = UI_EVENT_TX_STOP;
+        return 1;
+    }
+
+    if (cmd_starts(cmd, "TXSEL") || cmd_starts(cmd, "TXTEXT")) {
+        const char *arg = skip_command_arg(cmd, cmd_starts(cmd, "TXSEL") ? "TXSEL" : "TXTEXT");
+        unsigned preset_index = 0U;
+        const int has_numeric_index = parse_uint_arg(arg, &preset_index);
+        for (size_t i = 0; i < sizeof(s_tx_text_presets) / sizeof(s_tx_text_presets[0]); ++i) {
+            if (cmd_equals(arg, s_tx_text_presets[i].label) ||
+                (has_numeric_index && preset_index == i)) {
+                display_set_tx_text_selection((uint8_t)i);
+                event->type = UI_EVENT_TX_TEXT;
+                event->tx_psk_mode = display_state->selected_tx_psk_mode;
+                event->tx_tone_hz = display_state->tx_tone_hz > 0 ? display_state->tx_tone_hz : 1500;
+                strncpy(event->tx_text, s_tx_text_presets[i].text, sizeof(event->tx_text) - 1);
+                event->tx_text[sizeof(event->tx_text) - 1] = '\0';
+                return 1;
+            }
+        }
+        printf("[cmd] error TXSEL must be 0..%u or CQ/BER/ASCII/LOOP\r\n",
+               (unsigned)((sizeof(s_tx_text_presets) / sizeof(s_tx_text_presets[0])) - 1U));
+        return 1;
+    }
+
+    if (cmd_starts(cmd, "TX")) {
+        const char *arg = skip_command_arg(cmd, "TX");
+        const char *text = *arg ? arg : UI_TX_TEXT_DEFAULT;
+        event->type = UI_EVENT_TX_TEXT;
+        event->tx_psk_mode = display_state->selected_tx_psk_mode;
+        event->tx_tone_hz = display_state->tx_tone_hz > 0 ? display_state->tx_tone_hz : 1500;
+        strncpy(event->tx_text, text, sizeof(event->tx_text) - 1);
+        event->tx_text[sizeof(event->tx_text) - 1] = '\0';
+        return 1;
+    }
+
+    if (cmd_starts(cmd, "OUTVOL")) {
+        const char *arg = skip_command_arg(cmd, "OUTVOL");
+        char *end = NULL;
+        const long dac = strtol(arg, &end, 0);
+        const long hp = strtol(skip_spaces(end), NULL, 0);
+        if (end == arg || dac < 0 || dac > 255 || hp < 0 || hp > 127) {
+            printf("[cmd] error output volume must be: OUTVOL <dac 0..255> <hp 0..127>\r\n");
+            return 1;
+        }
+        event->type = UI_EVENT_OUTPUT_GAIN;
+        event->output_dac_volume = (int)dac;
+        event->output_hp_volume = (int)hp;
+        return 1;
+    }
+
+    if (cmd_starts(cmd, "INGAIN") || cmd_starts(cmd, "MICGAIN")) {
+        const char *arg = skip_command_arg(cmd, cmd_starts(cmd, "INGAIN") ? "INGAIN" : "MICGAIN");
+        char *end = NULL;
+        const float gain_db = strtof(arg, &end);
+        if (end == arg || gain_db < 0.0f || gain_db > 42.0f) {
+            printf("[cmd] error input gain must be: INGAIN <0..42 dB>\r\n");
+            return 1;
+        }
+        event->type = UI_EVENT_INPUT_GAIN;
+        event->input_gain_db = gain_db;
+        printf("[gain] input %.1fdB\r\n", (double)gain_db);
+        return 1;
+    }
+
+    if (cmd_starts(cmd, "RXDIAG") || cmd_starts(cmd, "DIAG")) {
+        event->type = UI_EVENT_RX_DIAG;
+        return 1;
+    }
+
+    if (cmd_starts(cmd, "FECBRANCH")) {
+        const char *arg = skip_spaces(skip_command_arg(cmd, "FECBRANCH"));
+        if (cmd_equals(arg, "AUTO")) {
+            event->type = UI_EVENT_RX_FEC_BRANCH;
+            event->fec_branch_override = -1;
+            printf("[fecbranch] auto\r\n");
+            return 1;
+        }
+        char *end = NULL;
+        const long branch = strtol(arg, &end, 0);
+        if (end == arg || branch < 0 || branch > 1) {
+            printf("[cmd] error FECBRANCH must be AUTO, 0, or 1\r\n");
+            return 1;
+        }
+        event->type = UI_EVENT_RX_FEC_BRANCH;
+        event->fec_branch_override = (int)branch;
+        printf("[fecbranch] %d\r\n", event->fec_branch_override);
+        return 1;
+    }
+
+    if (cmd_starts(cmd, "STATUS")) {
+        printf("[status] role=%s rxmode=%s psk=%s txmode=%s tone=%dHz txtone=%dHz tx=%d/%u\r\n",
+               display_state->display_role ? "TX" : "RX",
+               modem_mode_name(display_state->selected_mode),
+               psk_mode_name(display_state->selected_psk_mode),
+               psk_mode_name(display_state->selected_tx_psk_mode),
+               display_state->rx_tone_hz,
+               display_state->tx_tone_hz,
+               display_state->tx_active,
+               (unsigned)display_state->tx_queued);
+        return 1;
+    }
+
+    return 0;
 }
 
 static ui_event_t poll_serial_command(const display_state_t *display_state)
@@ -290,16 +453,15 @@ static ui_event_t poll_serial_command(const display_state_t *display_state)
             if (ch == '\r' || ch == '\n') {
                 if (s_serial_cmd_len > 0) {
                     s_serial_cmd[s_serial_cmd_len] = '\0';
-                    if (s_serial_cmd[0] == '@') {
-                        if (handle_capture_command(s_serial_cmd + 1)) {
-                            ESP_LOGI(TAG, "serial capture command: %s", s_serial_cmd);
-                        } else if (parse_serial_tx_command(s_serial_cmd, display_state, &event)) {
-                            ESP_LOGI(TAG, "serial tx command: %s", s_serial_cmd);
-                        } else if (parse_serial_mode_command(s_serial_cmd, &event)) {
-                            ESP_LOGI(TAG, "serial mode command: %s", s_serial_cmd);
-                        } else {
-                            ESP_LOGW(TAG, "unknown serial mode command: %s", s_serial_cmd);
-                        }
+                    const char *cmd = s_serial_cmd[0] == '@' ? s_serial_cmd + 1 : s_serial_cmd;
+                    if (handle_capture_command(cmd)) {
+                        ESP_LOGI(TAG, "serial capture command: %s", s_serial_cmd);
+                    } else if (parse_serial_control_command(s_serial_cmd, display_state, &event)) {
+                        ESP_LOGI(TAG, "serial control command: %s", s_serial_cmd);
+                    } else if (parse_serial_mode_command(s_serial_cmd, &event)) {
+                        ESP_LOGI(TAG, "serial mode command: %s", s_serial_cmd);
+                    } else {
+                        ESP_LOGW(TAG, "unknown serial command: %s", s_serial_cmd);
                     }
                     s_serial_cmd_len = 0;
                     if (event.type != UI_EVENT_NONE) {
@@ -347,10 +509,52 @@ ui_event_t ui_poll(const display_state_t *display_state)
         return event;
     }
 
+    int display_role;
+    if (display_take_role_selection(&display_role)) {
+        event.type = UI_EVENT_DISPLAY_ROLE_CHANGED;
+        event.display_role = display_role != 0;
+        return event;
+    }
+
+    psk_mode_t display_psk_mode;
+    if (display_take_mode_selection(&display_psk_mode)) {
+        if (display_state->display_role) {
+            event.type = UI_EVENT_TX_MODE_CHANGED;
+            event.tx_psk_mode = display_psk_mode;
+        } else {
+            event.type = UI_EVENT_PSK_MODE_CHANGED;
+            event.psk_mode = display_psk_mode;
+        }
+        return event;
+    }
+
+    uint8_t tx_text_index;
+    if (display_take_tx_text_selection(&tx_text_index)) {
+        if (tx_text_index < sizeof(s_tx_text_presets) / sizeof(s_tx_text_presets[0])) {
+            display_set_tx_text_selection(tx_text_index);
+            event.type = UI_EVENT_TX_TEXT;
+            event.tx_psk_mode = display_state->selected_tx_psk_mode;
+            event.tx_tone_hz = display_state->tx_tone_hz > 0 ? display_state->tx_tone_hz : 1500;
+            strncpy(event.tx_text, s_tx_text_presets[tx_text_index].text,
+                    sizeof(event.tx_text) - 1);
+            event.tx_text[sizeof(event.tx_text) - 1] = '\0';
+            return event;
+        }
+    }
+
     int tone_hz;
     if (display_take_tone_selection(&tone_hz)) {
-        event.type = UI_EVENT_TONE_CHANGED;
-        event.tone_hz = tone_hz;
+        if (display_state->display_role) {
+            event.type = UI_EVENT_TX_TEXT;
+            event.tx_psk_mode = display_state->selected_tx_psk_mode;
+            event.tx_tone_hz = tone_hz;
+            const size_t text_len = strnlen(display_state->tx_text, sizeof(event.tx_text) - 1);
+            memcpy(event.tx_text, display_state->tx_text, text_len);
+            event.tx_text[text_len] = '\0';
+        } else {
+            event.type = UI_EVENT_TONE_CHANGED;
+            event.tone_hz = tone_hz;
+        }
         return event;
     }
 

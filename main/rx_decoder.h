@@ -5,6 +5,7 @@
 
 #include "demod_primitives.h"
 #include "psk_modes.h"
+#include "psk_rx.h"
 #include "psk_rtty.h"
 
 typedef struct decoder_layer decoder_layer_t;
@@ -30,6 +31,7 @@ void decoder_layer_feed(decoder_layer_t *d, const int16_t *samples, size_t count
 struct decoder_layer {
     decoder_layer_config_t config;
     const demod_profile_t *profile;
+    psk_rx_t psk_rx;
     psk_rtty_rx_t psk_rtty_rx;
     uint32_t symbol_samples;
     int16_t symbol_buf[640];

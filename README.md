@@ -6,23 +6,17 @@
 
 ## 当前功能
 
-已接入的调制方式：
+当前 UI/串口命令入口对齐 HPM6750 工程，使用 PSK/QPSK/8PSK 模式：
 
 - BPSK31
 - PSK63 及扩展 PSK/QPSK/8PSK 模式
-- FT8
-- FT4
-- RTTY 45.45 baud / 170 Hz shift
-- CW
-- MFSK16
 
 主要功能：
 
-- 统一解码入口：所有音频进入 `modem_process()` / `decoder_layer_feed()`。
-- PSK/RTTY：`components/psk_rtty`，host 回归覆盖 27 个 PSK 模式。
-- FT8/FT4：集成 `components/ft8lib`。
+- 统一 PSK 解码入口：所有音频进入 `modem_process()` / `decoder_layer_feed()`。
+- PSK：`components/psk_rtty`，host 回归覆盖 27 个 PSK/QPSK/8PSK 模式。
 - 显示：通过 ESP32-P4 BSP/LVGL 显示频谱、瀑布图和解码文本。
-- 音频：通过 ESP32-P4 BSP `esp_codec_dev` 麦克风路径采样，48 kHz 输入抽取到 16 kHz modem 处理。
+- 音频：通过 ESP32-P4 BSP `esp_codec_dev` 麦克风路径采样，48 kHz 输入按 HPM6750 逻辑直接进入 modem 处理。
 - 输出：USB 串口可用；WiFi 在 ESP32-P4 上不可用；BT 入口保留但未实现 BLE/SPP 后端。
 
 ## 架构概览
@@ -30,8 +24,8 @@
 ```text
 ESP32-P4 BSP microphone / I2S
     -> audio_input.c
-    -> modem.c
-    -> decoder_layer.c
+    -> rx_modem.c
+    -> rx_decoder.c
     -> mode backend
     -> decoded bytes
     -> transport.c
@@ -41,17 +35,17 @@ ESP32-P4 BSP microphone / I2S
 
 - `main/audio_input.c`：ESP32-P4 BSP 麦克风输入、采样和抽取。
 - `main/display.c`：ESP32-P4 BSP/LVGL 显示、瀑布图和触摸调谐。
-- `main/modem.c`：公开 modem API、模式切换、频点设置和输出缓冲。
-- `main/decoder_layer.c`：统一解码层，按模式 family 分发到后端。
-- `components/psk_rtty`：PSK/RTTY 后端。
-- `components/ft8lib`：FT8/FT4 后端。
+- `main/rx_modem.c`：公开 modem API、模式切换、频点设置和输出缓冲。
+- `main/rx_decoder.c`：统一解码层，按模式 family 分发到后端。
+- `components/psk_rtty`：PSK 后端。
 
 ## 硬件默认配置
 
 - 目标芯片：`esp32p4`
 - 目标板：ESP32-P4 Function EV Board BSP
 - Codec 输入采样率：`BOARD_CODEC_SAMPLE_RATE_HZ = 48000`
-- Modem 处理采样率：`BOARD_MODEM_SAMPLE_RATE_HZ = 16000`
+- Modem 处理采样率：`BOARD_MODEM_SAMPLE_RATE_HZ = 48000`
+- 瀑布图显示流：8 kHz / 512 samples / 8192 FFT / 0-3000 Hz
 - I2S/I2C/LCD/触摸：使用 BSP 定义的 P4 Function EV Board 引脚
 - 用户按键：GPIO0，用于循环切换模式
 
@@ -63,11 +57,11 @@ PSK FEC/Viterbi 大表使用 `EXT_RAM_BSS_ATTR` 放入 PSRAM，`sdkconfig.defaul
 
 ```powershell
 C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe -NoExit -ExecutionPolicy Bypass -NoProfile -Command "& {. 'C:\Espressif\tools\Microsoft.v5.5.5.PowerShell_profile.ps1'}"
-idf.py -B build-idf set-target esp32p4
-idf.py -B build-idf build
+idf.py -B build set-target esp32p4
+idf.py -B build build
 ```
 
-`build` 目录用于 host 工具，固件构建目录使用 `build-idf`。
+固件产物和 host 工具都统一生成在 `build` 目录下。
 
 ## Host 回归
 
@@ -76,12 +70,12 @@ powershell -ExecutionPolicy Bypass -File .\tools\build_host_tools.ps1
 powershell -ExecutionPolicy Bypass -File .\tools\run_host_regression.ps1 -WavDir C:\projects\psk-script\generated-wav-48000 -Expected C:\projects\psk-script\input.txt
 ```
 
-当前验证结果：`PASS=27 FAIL=0 NO-WAV=0 TOTAL=27`。
+当前 WAV 回归结果与 HPM6750 工程一致：`PASS=26 FAIL=1 NO-WAV=0 TOTAL=27`，唯一失败项为 `2xPSK1000` 语料匹配。TX/RX roundtrip 结果：`failures=0`。
 
 ## 烧录
 
 ```powershell
-idf.py -B build-idf -p COMx flash monitor
+idf.py -B build -p COMx flash monitor
 ```
 
 将 `COMx` 替换为实际串口号。

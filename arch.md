@@ -18,8 +18,8 @@
 ```mermaid
 flowchart LR
     MIC["ES7210 / I2S 音频输入"] --> AIN["audio_input.c<br/>采样与抽取"]
-    AIN --> MODEM["modem.c<br/>统一 modem API"]
-    MODEM --> DL["decoder_layer.c<br/>统一解码层"]
+    AIN --> MODEM["rx_modem.c<br/>统一 modem API"]
+    MODEM --> DL["rx_decoder.c<br/>统一解码层"]
     DL --> OUTBUF["解码字节流"]
     OUTBUF --> TRANSPORT["transport.c<br/>USB / WiFi / BT 三选一"]
     OUTBUF --> SCREEN["display.c<br/>解码文本显示"]
@@ -44,7 +44,7 @@ ES7210/I2S audio
     -> screen decoded text and waterfall
 ```
 
-`main/modem.c` 保持很薄。它维护公开 modem 状态和输出缓冲区，然后把所有接收处理交给 `main/decoder_layer.c`。
+`main/rx_modem.c` 保持很薄。它维护公开 modem 状态和输出缓冲区，然后把所有接收处理交给 `main/rx_decoder.c`。
 
 ## 分层职责
 
@@ -64,8 +64,8 @@ flowchart TB
     end
 
     subgraph MODEM_LAYER[统一 modem 层]
-        M1["modem.c<br/>公开 API 与输出缓冲"]
-        M2["decoder_layer.c<br/>按 family 分发"]
+        M1["rx_modem.c<br/>公开 API 与输出缓冲"]
+        M2["rx_decoder.c<br/>按 family 分发"]
         M3["demod_primitives.c<br/>profile 与 DSP 基础函数"]
     end
 
@@ -93,8 +93,8 @@ flowchart TB
 各层边界：
 
 - `audio_input.c` 只负责音频采集和抽取。
-- `modem.c` 只负责统一 API、模式切换、频点设置和输出缓冲。
-- `decoder_layer.c` 负责统一分发和模式后端状态。
+- `rx_modem.c` 只负责统一 API、模式切换、频点设置和输出缓冲。
+- `rx_decoder.c` 负责统一分发和模式后端状态。
 - `demod_primitives.c` 负责 profile、tone clamp、tone power 等基础函数。
 - `transport.c` 负责二进制字节输出，不能假设输出是 C 字符串。
 - `display.c` 和 `ui.c` 只通过事件和 profile 与 modem 交互，不直接操作协议解码器。
@@ -136,7 +136,7 @@ UI 和瀑布图使用同一张 profile 表，因此新增模式时，解码选�
 
 ## 统一解码层
 
-`main/decoder_layer.c` 是公共接收分发器。它持有以下共享状态：
+`main/rx_decoder.c` 是公共接收分发器。它持有以下共享状态：
 
 - 符号缓冲区
 - 当前选择的 demod profile
@@ -383,7 +383,7 @@ flowchart TB
 1. 新增或更新对应的 `demod_profile_t`。
 2. 尽量复用已有 DSP 基础组件。
 3. 只增加该调制家族真正需要的最小后端状态。
-4. 保持公开模式切换在 `modem.c`，统一分发在 `decoder_layer.c`。
+4. 保持公开模式切换在 `rx_modem.c`，统一分发在 `rx_decoder.c`。
 5. 通过统一 callback 输出解码字节。
 6. 不要为单个模式再新增顶层 decoder API。
 

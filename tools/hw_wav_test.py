@@ -1,5 +1,7 @@
 import argparse
+import importlib
 import re
+import sys
 import threading
 import time
 import wave
@@ -8,6 +10,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import serial
+
+IDF_PYSERIAL_SITE = Path(r"C:\Espressif\tools\python\v5.5.5\venv\Lib\site-packages")
+if not hasattr(serial, "Serial") and IDF_PYSERIAL_SITE.exists():
+    sys.path.insert(0, str(IDF_PYSERIAL_SITE))
+    sys.modules.pop("serial", None)
+    serial = importlib.import_module("serial")
 
 
 DEFAULT_MODES = [
@@ -84,6 +92,7 @@ def normalize_text(text: str) -> str:
 
 
 def strip_logs(text: str) -> str:
+    text = re.sub(r"[EWIDV] \(\d+\) [^\r\n]*(?:\r?\n)?", "\n", text)
     kept = []
     for line in text.replace("\r", "\n").split("\n"):
         if re.match(r"^[EWIDV] \(\d+\) ", line):
@@ -120,6 +129,7 @@ def bit_count(value: int) -> int:
 def best_error_stats(decoded: str, expected: str) -> dict:
     decoded = normalize_text(decoded)
     expected = normalize_text(expected)
+    period = expected + " "
     stats = {
         "decoded_len": len(decoded),
         "best_offset": -1,
@@ -133,35 +143,65 @@ def best_error_stats(decoded: str, expected: str) -> dict:
     if not decoded:
         return stats
 
-    repeated = (expected + " ") * max(2, (len(decoded) // max(1, len(expected))) + 3)
-    if len(decoded) > len(repeated):
-        repeated = repeated * ((len(decoded) // len(repeated)) + 2)
+    def eval_offset(offset: int) -> tuple[int, int, int, int]:
+        char_errors = 0
+        bit_errors = 0
+        plen = len(period)
+        for i, ch in enumerate(decoded):
+            expected_byte = ord(period[(offset + i) % plen]) & 0xff
+            decoded_byte = ord(ch) & 0xff
+            if expected_byte != decoded_byte:
+                char_errors += 1
+                bit_errors += bit_count(expected_byte ^ decoded_byte)
+        total_bits = len(decoded) * 8
+        return bit_errors, char_errors, len(decoded), total_bits
+
+    candidates = {0}
+    plen = len(period)
+    for size in range(min(len(expected), 220), 39, -20):
+        found = False
+        for start in range(0, max(1, len(expected) - size + 1), max(1, size // 4)):
+            pos = decoded.find(expected[start:start + size])
+            if pos >= 0:
+                base = (start - pos) % plen
+                for delta in range(-2, 3):
+                    candidates.add((base + delta) % plen)
+                found = True
+                break
+        if found:
+            break
+
+    if len(candidates) == 1:
+        sample_len = min(len(decoded), 2048)
+        sample = decoded[:sample_len]
+        sample_scores = []
+        for offset in range(plen):
+            char_errors = 0
+            bit_errors = 0
+            for i, ch in enumerate(sample):
+                expected_byte = ord(period[(offset + i) % plen]) & 0xff
+                decoded_byte = ord(ch) & 0xff
+                if expected_byte != decoded_byte:
+                    char_errors += 1
+                    bit_errors += bit_count(expected_byte ^ decoded_byte)
+            sample_scores.append((bit_errors, char_errors, offset))
+        for _, _, offset in sorted(sample_scores)[:8]:
+            for delta in range(-2, 3):
+                candidates.add((offset + delta) % plen)
 
     best_bit_errors = 10**9
     best_char_errors = 10**9
     best_compared = 0
     best_total_bits = 0
     best_offset = -1
-    max_start = max(0, len(repeated) - 1)
-    for start in range(0, max_start + 1):
-        compared = min(len(decoded), len(repeated) - start)
-        if compared <= 0:
-            continue
-        bit_errors = abs(len(decoded) - compared) * 8
-        char_errors = abs(len(decoded) - compared)
-        for i in range(compared):
-            expected_byte = ord(repeated[start + i]) & 0xff
-            decoded_byte = ord(decoded[i]) & 0xff
-            if expected_byte != decoded_byte:
-                char_errors += 1
-                bit_errors += bit_count(expected_byte ^ decoded_byte)
-        total_bits = max(len(decoded), compared) * 8
+    for offset in sorted(candidates):
+        bit_errors, char_errors, compared, total_bits = eval_offset(offset)
         if bit_errors < best_bit_errors or (bit_errors == best_bit_errors and char_errors < best_char_errors):
             best_bit_errors = bit_errors
             best_char_errors = char_errors
             best_compared = compared
             best_total_bits = total_bits
-            best_offset = start
+            best_offset = offset
             if bit_errors == 0:
                 break
 
@@ -259,6 +299,41 @@ def make_wav_clip(src: Path, dst: Path, offset_seconds: float, max_seconds: floa
     return frames / float(rate)
 
 
+def play_wav(path: Path, device: int | None, differential_stereo: bool, left_only: bool) -> None:
+    if device is None:
+        winsound.PlaySound(str(path), winsound.SND_FILENAME)
+        return
+
+    import numpy as np
+    import sounddevice as sd
+
+    with wave.open(str(path), "rb") as wav:
+        channels = wav.getnchannels()
+        sample_width = wav.getsampwidth()
+        sample_rate = wav.getframerate()
+        frames = wav.readframes(wav.getnframes())
+
+    if sample_width != 2:
+        raise ValueError(f"unsupported WAV sample width: {sample_width}")
+
+    audio = np.frombuffer(frames, dtype="<i2")
+    if channels > 1:
+        audio = audio.reshape(-1, channels)
+    else:
+        mono = audio.reshape(-1, 1)
+        audio = np.repeat(mono, 2, axis=1)
+
+    if differential_stereo:
+        mono = audio[:, 0].astype(np.int16)
+        audio = np.column_stack((mono, np.clip(-mono.astype(np.int32), -32768, 32767).astype(np.int16)))
+    elif left_only:
+        mono = audio[:, 0].astype(np.int16)
+        audio = np.column_stack((mono, np.zeros_like(mono)))
+
+    sd.play(audio, samplerate=sample_rate, device=device, blocking=True)
+    sd.stop()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", default="COM14")
@@ -274,10 +349,16 @@ def main() -> int:
     parser.add_argument("--max-seconds", type=float, default=45.0)
     parser.add_argument("--gain", type=float, default=0.25)
     parser.add_argument("--min-fragment", type=int, default=60)
+    parser.add_argument("--device", type=int, help="sounddevice output device index; defaults to winsound")
+    parser.add_argument("--differential-stereo", action="store_true")
+    parser.add_argument("--left-only", action="store_true")
+    parser.add_argument("--raw-log-dir", type=Path, help="directory for unfiltered serial logs")
     args = parser.parse_args()
 
     modes = args.mode or (ALL_PSK if args.all_psk else (ALL_BPSK_QPSK if args.all_bpsk_qpsk else DEFAULT_MODES))
     expected = args.expected.read_text(encoding="utf-8")
+    if args.raw_log_dir:
+        args.raw_log_dir.mkdir(parents=True, exist_ok=True)
 
     cap = SerialCapture(args.port, args.baud)
     try:
@@ -302,10 +383,13 @@ def main() -> int:
                 clip_path = tmp_dir / f"{mode}.wav"
                 clip_dur = make_wav_clip(wav_path, clip_path, args.offset, args.max_seconds, args.gain)
                 print(f"{mode:9s} play {clip_dur:.1f}s/{full_dur:.1f}s offset={args.offset:.1f}s gain={args.gain:.2f}", flush=True)
-                winsound.PlaySound(str(clip_path), winsound.SND_FILENAME)
+                play_wav(clip_path, args.device, args.differential_stereo, args.left_only)
                 time.sleep(args.tail)
 
-                raw = cap.snapshot().decode("utf-8", errors="ignore")
+                raw_bytes = cap.snapshot()
+                if args.raw_log_dir:
+                    (args.raw_log_dir / f"{mode}.log").write_bytes(raw_bytes)
+                raw = raw_bytes.decode("utf-8", errors="ignore")
                 decoded = strip_logs(raw)
                 stats = best_error_stats(decoded, expected)
                 ok = has_expected_fragment(decoded, expected, args.min_fragment)

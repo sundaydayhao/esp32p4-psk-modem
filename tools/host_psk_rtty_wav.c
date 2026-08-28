@@ -1,4 +1,5 @@
 #include "psk_rtty.h"
+#include "psk_rx.h"
 #include "audio_decim.h"
 
 #include <ctype.h>
@@ -7,11 +8,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Mirror the firmware audio path: 48 kHz codec/audio-file input is filtered,
- * DC-blocked, and decimated by 3 before the PSK decoder sees 16 kHz mono. */
+/* Mirror the firmware audio path: 48 kHz codec/audio-file input is filtered
+ * and DC-blocked before the PSK decoder sees 48 kHz mono. */
 #define HOST_CODEC_RATE_HZ 48000
-#define HOST_DECODE_RATE_HZ 16000
-#define HOST_DECIMATION (HOST_CODEC_RATE_HZ / HOST_DECODE_RATE_HZ)
+#define HOST_DECODE_RATE_HZ 48000
 
 typedef struct {
     char *data;
@@ -164,6 +164,67 @@ static void apply_input_impairments(int16_t *samples, size_t count)
     }
 }
 
+static int16_t clamp_i16_from_double(double v)
+{
+    if (v > 32767.0) {
+        return 32767;
+    }
+    if (v < -32768.0) {
+        return -32768;
+    }
+    return (int16_t)(v >= 0.0 ? v + 0.5 : v - 0.5);
+}
+
+static int resample_linear(const int16_t *in, size_t in_count, int in_rate,
+                           int out_rate, int16_t **out, size_t *out_count)
+{
+    if (!in || !out || !out_count || in_count == 0U || in_rate <= 0 || out_rate <= 0) {
+        return 0;
+    }
+
+    const size_t n = (size_t)((double)in_count * (double)out_rate /
+                              (double)in_rate + 0.5);
+    if (n == 0U) {
+        return 0;
+    }
+
+    int16_t *resampled = (int16_t *)malloc(n * sizeof(int16_t));
+    if (!resampled) {
+        return 0;
+    }
+
+    for (size_t i = 0U; i < n; ++i) {
+        const double src = (double)i * (double)in_rate / (double)out_rate;
+        size_t base = (size_t)src;
+        if (base >= in_count) {
+            base = in_count - 1U;
+        }
+        const size_t next = base + 1U < in_count ? base + 1U : base;
+        const double frac = src - (double)base;
+        const double a = (double)in[base];
+        const double b = (double)in[next];
+        resampled[i] = clamp_i16_from_double(a + (b - a) * frac);
+    }
+
+    *out = resampled;
+    *out_count = n;
+    return 1;
+}
+
+static int host_decode_rate_hz(void)
+{
+    const char *text = getenv("PSK_HOST_DECODE_RATE_HZ");
+    if (!text || !text[0]) {
+        return HOST_DECODE_RATE_HZ;
+    }
+    const long rate = strtol(text, NULL, 10);
+    if (rate <= 0 || HOST_CODEC_RATE_HZ % rate != 0) {
+        fprintf(stderr, "invalid PSK_HOST_DECODE_RATE_HZ=%s\n", text);
+        exit(2);
+    }
+    return (int)rate;
+}
+
 static psk_rtty_mode_t parse_mode(const char *name)
 {
     if (strcmp(name, "BPSK31") == 0) {
@@ -251,6 +312,18 @@ static psk_rtty_mode_t parse_mode(const char *name)
     exit(2);
 }
 
+static psk_mode_t parse_app_mode(const char *name)
+{
+    for (size_t i = 0U; i < psk_mode_count(); ++i) {
+        const psk_mode_info_t *info = psk_mode_info_at(i);
+        if (info && strcmp(name, info->name) == 0) {
+            return info->id;
+        }
+    }
+    fprintf(stderr, "unknown application mode: %s\n", name);
+    exit(2);
+}
+
 static char *clean_text(const char *s)
 {
     size_t n = strlen(s);
@@ -330,34 +403,50 @@ int main(int argc, char **argv)
         fprintf(stderr, "failed to read wav: %s\n", argv[2]);
         return 1;
     }
-    apply_input_impairments(samples, count);
 
-    int16_t *decode_samples = samples;
-    size_t decode_count = count;
-    int decode_rate = rate;
+    int16_t *codec_samples = samples;
+    size_t codec_count = count;
+    int codec_rate = rate;
+    int16_t *resampled = NULL;
+    if (rate != HOST_CODEC_RATE_HZ) {
+        if (!resample_linear(samples, count, rate, HOST_CODEC_RATE_HZ,
+                             &resampled, &codec_count)) {
+            fprintf(stderr, "failed to resample %s from %d Hz to %d Hz\n",
+                    argv[2], rate, HOST_CODEC_RATE_HZ);
+            free(samples);
+            return 1;
+        }
+        codec_samples = resampled;
+        codec_rate = HOST_CODEC_RATE_HZ;
+    }
+    apply_input_impairments(codec_samples, codec_count);
+
+    const int target_decode_rate = host_decode_rate_hz();
+    int16_t *decode_samples = codec_samples;
+    size_t decode_count = codec_count;
+    int decode_rate = codec_rate;
     int16_t *decimated = NULL;
-    if (rate == HOST_CODEC_RATE_HZ) {
-        decimated = (int16_t *)malloc((count / HOST_DECIMATION + 1U) * sizeof(int16_t));
+    if (codec_rate == HOST_CODEC_RATE_HZ) {
+        const uint32_t decimation = (uint32_t)(HOST_CODEC_RATE_HZ / target_decode_rate);
+        decimated = (int16_t *)malloc((codec_count / decimation + 1U) * sizeof(int16_t));
         if (!decimated) {
             fprintf(stderr, "out of memory decimating %s\n", argv[2]);
+            free(resampled);
             free(samples);
             return 1;
         }
         audio_decim_state_t decim_state;
         audio_decim_init(&decim_state);
-        decode_count = audio_decim_process(&decim_state, samples, count, decimated, HOST_DECIMATION);
+        decode_count = audio_decim_process(&decim_state, codec_samples, codec_count,
+                                           decimated, decimation);
         decode_samples = decimated;
-        decode_rate = HOST_DECODE_RATE_HZ;
-    } else {
-        fprintf(stderr,
-                "warning: %s is %d Hz, not the codec rate %d Hz - decoding at native rate "
-                "instead of replaying through the real audio_input.c decimation path\n",
-                argv[2], rate, HOST_CODEC_RATE_HZ);
+        decode_rate = target_decode_rate;
     }
 
     decode_ctx_t decoded = {0};
     const char *tone_text = getenv("PSK_RX_TONE_HZ");
     const int rx_tone_hz = tone_text ? (int)strtol(tone_text, NULL, 10) : 1500;
+    const int use_modem = getenv("PSK_USE_MODEM") != NULL;
     psk_rtty_config_t cfg = {
         .mode = parse_mode(argv[1]),
         .sample_rate_hz = decode_rate,
@@ -366,15 +455,36 @@ int main(int argc, char **argv)
         .userdata = &decoded,
     };
     psk_rtty_rx_t rx;
-    psk_rtty_rx_init(&rx, &cfg);
-    rx.sq_thresh = 35;
+    psk_rx_t modem;
+    if (use_modem) {
+        const psk_rx_config_t modem_cfg = {
+            .mode = parse_app_mode(argv[1]),
+            .sample_rate_hz = decode_rate,
+            .rx_tone_hz = rx_tone_hz,
+            .squelch = 35,
+            .afc_enabled = 1,
+            .squelch_enabled = 1,
+        };
+        psk_rx_init(&modem, &modem_cfg);
+    } else {
+        psk_rtty_rx_init(&rx, &cfg);
+        rx.sq_thresh = 35;
+    }
     const char *afc = getenv("PSK_AFC");
     if (afc) {
-        rx.afc_enabled = strtol(afc, NULL, 10) != 0;
+        if (use_modem) {
+            psk_rx_set_afc(&modem, strtol(afc, NULL, 10) != 0);
+        } else {
+            rx.afc_enabled = strtol(afc, NULL, 10) != 0;
+        }
     }
     const char *warmup = getenv("PSK_WARMUP");
     if (warmup) {
-        rx.warmup_symbols = (int)strtol(warmup, NULL, 10);
+        if (use_modem) {
+            modem.rx.warmup_symbols = (int)strtol(warmup, NULL, 10);
+        } else {
+            rx.warmup_symbols = (int)strtol(warmup, NULL, 10);
+        }
     }
 
     const size_t block = 512;
@@ -384,22 +494,33 @@ int main(int argc, char **argv)
             n = block;
         }
         decoded.current_sample = pos;
-        psk_rtty_rx_feed(&rx, decode_samples + pos, n);
+        if (use_modem) {
+            char frame_text[1024];
+            const size_t frame_len = psk_rx_process(&modem, decode_samples + pos, n,
+                                                       frame_text, sizeof(frame_text));
+            for (size_t i = 0U; i < frame_len; ++i) {
+                append_char(frame_text[i], &decoded);
+            }
+        } else {
+            psk_rtty_rx_feed(&rx, decode_samples + pos, n);
+        }
     }
+
+    const psk_rtty_rx_t *active_rx = use_modem ? &modem.rx : &rx;
 
     size_t match_len = argc >= 5 ? (size_t)strtoul(argv[4], NULL, 10) : 60U;
     int ok = has_expected_fragment(decoded.text.data ? decoded.text.data : "", argv[3], match_len);
     const double first_ms = decoded.have_first_char ?
         ((double)decoded.first_char_sample * 1000.0 / (double)decode_rate) : -1.0;
-    const float tracked_hz = (rx.nco_phase_inc + rx.freq_error) * (float)decode_rate /
+    const float tracked_hz = (active_rx->nco_phase_inc + active_rx->freq_error) * (float)decode_rate /
                              6.28318530717958647692f;
     printf("%s decoded=%zu first_ms=%.1f symbols=%lu bits=%lu chars=%lu sq=%d/%d lock=%u "
            "tone=%d/%.1f fm=%d/%d fs=%u match=%s\n",
            argv[1], decoded.text.len, first_ms,
-           (unsigned long)rx.debug_symbols, (unsigned long)rx.debug_bits,
-           (unsigned long)rx.debug_chars, rx.sq_level, rx.sq_thresh, rx.lock_state,
+           (unsigned long)active_rx->debug_symbols, (unsigned long)active_rx->debug_bits,
+           (unsigned long)active_rx->debug_chars, active_rx->sq_level, active_rx->sq_thresh, active_rx->lock_state,
            rx_tone_hz, tracked_hz,
-           rx.debug_fec_metric[0], rx.debug_fec_metric[1], rx.debug_fec_selected,
+           active_rx->debug_fec_metric[0], active_rx->debug_fec_metric[1], active_rx->debug_fec_selected,
            ok ? "yes" : "no");
     if (decoded.text.data) {
         fwrite(decoded.text.data, 1, decoded.text.len < 500 ? decoded.text.len : 500, stdout);
@@ -408,6 +529,7 @@ int main(int argc, char **argv)
 
     free(decoded.text.data);
     free(decimated);
+    free(resampled);
     free(samples);
     return ok ? 0 : 1;
 }
