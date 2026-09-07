@@ -134,7 +134,7 @@ static void remember_touch_point(void);
 
 esp_err_t display_init(void)
 {
-    const bsp_display_cfg_t cfg = {
+    bsp_display_cfg_t cfg = {
         .lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG(),
         .buffer_size = BSP_LCD_DRAW_BUFF_SIZE,
         .double_buffer = BSP_LCD_DRAW_BUFF_DOUBLE,
@@ -167,6 +167,7 @@ esp_err_t display_init(void)
             .sw_rotate = true,
         },
     };
+    cfg.lvgl_port_cfg.task_affinity = 1;
     lv_display_t *disp = bsp_display_start_with_config(&cfg);
     if (!disp) {
         return ESP_FAIL;

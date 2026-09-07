@@ -6,6 +6,7 @@
 #include "psk_modes.h"
 
 const uint32_t *psk_codec_mfsk_varicode_table(void);
+uint32_t psk_codec_varicode_code(uint8_t ch);
 void psk_codec_append_bit(uint8_t *bits, size_t *len, uint8_t bit);
 void psk_codec_append_varicode_text(uint8_t *bits, size_t *len, const char *text);
 void psk_codec_append_mfsk_char(uint8_t *bits, size_t *len, unsigned char ch);

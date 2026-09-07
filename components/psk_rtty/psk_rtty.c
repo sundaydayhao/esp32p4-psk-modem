@@ -95,10 +95,13 @@ static int s_tables_ready;
 static uint8_t s_vit_out_pair[VIT_MAX_STATES / 2U] PSK_FAST_BSS;
 static uint8_t s_vit_decisions0[VIT_MAX_TRACEBACK][4096] PSK_SDRAM_BSS;
 static uint8_t s_vit_decisions1[VIT_MAX_TRACEBACK][4096] PSK_SDRAM_BSS;
-static int16_t s_vit_metrics0_a[VIT_MAX_STATES] PSK_FAST_BSS;
-static int16_t s_vit_metrics0_b[VIT_MAX_STATES] PSK_FAST_BSS;
-static int16_t s_vit_metrics1_a[VIT_MAX_STATES] PSK_FAST_BSS;
-static int16_t s_vit_metrics1_b[VIT_MAX_STATES];
+static int16_t s_vit_metrics0_a[VIT_MAX_STATES] PSK_SDRAM_BSS;
+static int16_t s_vit_metrics0_b[VIT_MAX_STATES] PSK_SDRAM_BSS;
+static int16_t s_vit_metrics1_a[VIT_MAX_STATES] PSK_SDRAM_BSS;
+static int16_t s_vit_metrics1_b[VIT_MAX_STATES] PSK_SDRAM_BSS;
+/* K<=7 is the high-rate path. Keep its 512-byte working set in internal RAM;
+ * reserve PSRAM for K13/K16 instead of occupying 256 KiB of internal heap. */
+static int16_t s_vit_small[2][2][64];
 static uint16_t s_vit_sequence0[256];
 static uint16_t s_vit_sequence1[256];
 static uint8_t s_inlv_table0[2560];
@@ -139,7 +142,7 @@ static int rx_fec_ready(const psk_rtty_rx_t *rx);
 static void refresh_lock_state(psk_rtty_rx_t *rx);
 static void update_decision_directed_afc(psk_rtty_rx_t *rx, float angle, uint8_t phase_idx,
                                          uint8_t phase_states, int valid);
-static void update_8psk_nondat_afc(psk_rtty_rx_t *rx, float i, float q, int valid);
+static void update_8psk_nondat_afc(psk_rtty_rx_t *rx, uint8_t car, float i, float q, int valid);
 
 static const unsigned char s_rtty_table[0x20][2] = {
     {0, 0}, {'E', '3'}, {'\n', '\n'}, {'A', '-'}, {' ', ' '}, {'S', '\''}, {'I', '8'}, {'U', '7'},
@@ -316,6 +319,7 @@ static psk_mode_params_t mode_params(psk_rtty_mode_t mode)
     case PSK_RTTY_MODE_8PSK500F:
     case PSK_RTTY_MODE_8PSK1000F:
     case PSK_RTTY_MODE_8PSK1200F:
+    case PSK_RTTY_MODE_2X8PSK1200F:
         p.family = PSK_FAMILY_8PSK;
         p.bits_per_symbol = 3;
         p.mfsk_varicode = 1;
@@ -327,7 +331,8 @@ static psk_mode_params_t mode_params(psk_rtty_mode_t mode)
             p.baud = 500.0f;
         } else if (mode == PSK_RTTY_MODE_8PSK1000 || mode == PSK_RTTY_MODE_8PSK1000F) {
             p.baud = 1000.0f;
-        } else if (mode == PSK_RTTY_MODE_8PSK1200F) {
+        } else if (mode == PSK_RTTY_MODE_8PSK1200F || mode == PSK_RTTY_MODE_2X8PSK1200F) {
+            p.carriers = mode == PSK_RTTY_MODE_2X8PSK1200F ? 2 : 1;
             p.baud = 16000.0f / 13.0f;
         } else {
             p.baud = 125.0f;
@@ -373,7 +378,7 @@ static psk_mode_params_t mode_params(psk_rtty_mode_t mode)
     if (p.interleave_depth != 0U) {
         p.fec_settle_half_interleaves = 2U;
     }
-    if (mode == PSK_RTTY_MODE_8PSK1000F || mode == PSK_RTTY_MODE_8PSK1200F) {
+    if (mode == PSK_RTTY_MODE_8PSK1000F || mode == PSK_RTTY_MODE_8PSK1200F || mode == PSK_RTTY_MODE_2X8PSK1200F) {
         p.fec_settle_tracebacks = 2U;
         p.fec_settle_half_interleaves = 5U;
     }
@@ -413,6 +418,8 @@ static void reset_runtime(psk_rtty_rx_t *rx)
     rx->psk8_eighth_prev.x = 0.0f;
     rx->psk8_eighth_prev.y = 0.0f;
     rx->psk8_eighth_valid = 0U;
+    memset(rx->psk8_eighth_prev_carrier, 0, sizeof(rx->psk8_eighth_prev_carrier));
+    memset(rx->psk8_eighth_valid_carrier, 0, sizeof(rx->psk8_eighth_valid_carrier));
     rx->bit_phase_pos = 0.0f;
     const uint16_t fldigi_decim = params.symbol_samples > 15U ?
         (uint16_t)(params.symbol_samples / 16U) : 1U;
@@ -445,7 +452,7 @@ static void reset_runtime(psk_rtty_rx_t *rx)
     rx->sample_count = 0;
     rx->afc_enabled = PSKCORE_AFC_ON;
     for (uint8_t car = 0; car < MAX_PSK_CARRIERS; ++car) {
-        rx->chan_dec1_state[car] = PSKCORE_DEC4_LPFIR_LENGTH - 1;
+        rx->chan_dec1_state[car] = PSKCORE_BITFIR_LENGTH - 1;
         rx->chan_dec2_state[car] = PSKCORE_DEC4_LPFIR_LENGTH - 1;
         rx->chan_bit_fir_state[car] = PSKCORE_BITFIR_LENGTH - 1;
     }
@@ -778,6 +785,11 @@ static void reset_fec_branch(psk_rtty_rx_t *rx, uint8_t branch_index)
 {
     const uint16_t nstates = rx->fec_k ? (uint16_t)(1UL << (rx->fec_k - 1U)) : 0U;
     fec_branch_state_t *state = &s_fec_branch[branch_index];
+
+    state->metrics_a = nstates <= 64 ? s_vit_small[branch_index][0] :
+        (branch_index ? s_vit_metrics1_a : s_vit_metrics0_a);
+    state->metrics_b = nstates <= 64 ? s_vit_small[branch_index][1] :
+        (branch_index ? s_vit_metrics1_b : s_vit_metrics0_b);
 
     state->pair_count = 0;
     state->vit_step = 0;
@@ -1404,12 +1416,51 @@ static PSK_FAST_TEXT psk_rtty_complex_t fir_complex(const psk_rtty_complex_t *qu
     return acc;
 }
 
+static PSK_FAST_TEXT void store_second_stage(psk_rtty_rx_t *rx, uint8_t car, int pos,
+                                             psk_rtty_complex_t sample)
+{
+    if (pos < PSKCORE_DEC4_LPFIR_LENGTH) {
+        rx->chan_dec1_queue[car][pos] = sample;
+    } else {
+        rx->chan_dec2_queue[car][pos - PSKCORE_DEC4_LPFIR_LENGTH] = sample;
+    }
+}
+
+static PSK_FAST_TEXT psk_rtty_complex_t fir_second_stage(const psk_rtty_rx_t *rx,
+                                                         uint8_t car, int newest,
+                                                         const float *coef)
+{
+    psk_rtty_complex_t acc = {0.0f, 0.0f};
+    int pos = newest;
+    for (int i = 0; i < PSKCORE_BITFIR_LENGTH; ++i) {
+        const psk_rtty_complex_t sample = pos < PSKCORE_DEC4_LPFIR_LENGTH ?
+            rx->chan_dec1_queue[car][pos] :
+            rx->chan_dec2_queue[car][pos - PSKCORE_DEC4_LPFIR_LENGTH];
+        acc.x += sample.x * coef[i];
+        acc.y += sample.y * coef[i];
+        if (++pos >= PSKCORE_BITFIR_LENGTH) {
+            pos = 0;
+        }
+    }
+    return acc;
+}
+
 static PSK_FAST_TEXT void calc_bit_filter(psk_rtty_rx_t *rx, uint8_t car, psk_rtty_complex_t sample)
 {
+    const int sinc_1200f = rx->config.mode == PSK_RTTY_MODE_8PSK1200F ||
+                           rx->config.mode == PSK_RTTY_MODE_2X8PSK1200F;
+    const float *bit_fir = sinc_1200f ? s_bit_fir_1_over_13 : (rx->bit_fir ? rx->bit_fir : s_bit_fir);
     rx->chan_bit_queue[car][rx->chan_bit_fir_state[car]] = sample;
-    const float *bit_fir = rx->bit_fir ? rx->bit_fir : s_bit_fir;
     rx->chan_bit_signal[car] = fir_complex(rx->chan_bit_queue[car], rx->chan_bit_fir_state[car],
                                             PSKCORE_BITFIR_LENGTH, bit_fir);
+    if (sinc_1200f) {
+        store_second_stage(rx, car, rx->chan_dec1_state[car], rx->chan_bit_signal[car]);
+        rx->chan_bit_signal[car] = fir_second_stage(rx, car, rx->chan_dec1_state[car],
+                                                    s_bit_fir_1_over_16);
+        if (--rx->chan_dec1_state[car] < 0) {
+            rx->chan_dec1_state[car] = PSKCORE_BITFIR_LENGTH - 1;
+        }
+    }
     if (rx->psk_family == PSK_FAMILY_8PSK) {
         rx->chan_freq_signal[car] = rx->chan_bit_signal[car];
     } else {
@@ -1502,8 +1553,66 @@ static PSK_FAST_TEXT void calc_freq_error(psk_rtty_rx_t *rx, uint8_t car)
     }
 }
 
+static PSK_FAST_TEXT int symbol_sync_fractional(psk_rtty_rx_t *rx, float energy)
+{
+    const int timing_bins = rx->timing_bins > 0 ? rx->timing_bins : PSK_TIMING_MAX_BINS;
+    float bit_clock = rx->symbol_clock;
+    int index = (int)bit_clock;
+    if (index < 0) {
+        index = 0;
+    } else if (index >= timing_bins) {
+        index = timing_bins - 1;
+    }
+
+    /* fldigi aligns its fractional bit clock by comparing the two halves of
+     * the matched-filter magnitude waveform. */
+    rx->sync_ave[index] = 0.8f * rx->sync_ave[index] + 0.2f * energy;
+    float difference = 0.0f;
+    float amplitude = 0.0f;
+    const int half = timing_bins / 2;
+    for (int i = 0; i < half; ++i) {
+        difference += rx->sync_ave[i] - rx->sync_ave[i + half];
+        amplitude += rx->sync_ave[i] + rx->sync_ave[i + half];
+    }
+    const float timing_error = amplitude != 0.0f ? difference / amplitude : 0.0f;
+    const float nominal_clock = bit_clock + 1.0f;
+    bit_clock = nominal_clock - timing_error / (5.0f * 16.0f / (float)timing_bins);
+
+    while (bit_clock < 0.0f) {
+        bit_clock += (float)timing_bins;
+    }
+    int trigger = 0;
+    if (bit_clock >= (float)timing_bins) {
+        bit_clock -= (float)timing_bins;
+        trigger = 1;
+    }
+    const int nominal_trigger = nominal_clock >= (float)timing_bins;
+    if (trigger != nominal_trigger) {
+        rx->debug_timing_adjusts++;
+    }
+
+    if (trigger) {
+        float max_energy = -1.0e10f;
+        int max_pos = 0;
+        for (int i = 0; i < timing_bins; ++i) {
+            if (rx->sync_ave[i] > max_energy) {
+                max_pos = i;
+                max_energy = rx->sync_ave[i];
+            }
+        }
+        rx->raw_pk_pos = max_pos;
+        rx->last_pk_pos = rx->pk_pos;
+        rx->pk_pos = index;
+    }
+
+    rx->symbol_clock = bit_clock;
+    return trigger;
+}
+
 static PSK_FAST_TEXT int symbol_sync(psk_rtty_rx_t *rx, float energy)
 {
+    if (rx->config.mode == PSK_RTTY_MODE_8PSK1200F || rx->config.mode == PSK_RTTY_MODE_2X8PSK1200F)
+        return symbol_sync_fractional(rx, energy);
     int trigger = 0;
     int bit_pos = rx->bit_pos;
     const int timing_bins = rx->timing_bins > 0 ? rx->timing_bins : PSK_TIMING_MAX_BINS;
@@ -1856,9 +1965,10 @@ static void update_decision_directed_afc(psk_rtty_rx_t *rx, float angle, uint8_t
  * symbol is raised to the eighth power.  This gives a coarse carrier estimate
  * before hard constellation decisions are trustworthy, which is essential at
  * the 1200F capture boundary. */
-static void update_8psk_nondat_afc(psk_rtty_rx_t *rx, float i, float q, int valid)
+static void update_8psk_nondat_afc(psk_rtty_rx_t *rx, uint8_t car, float i, float q, int valid)
 {
-    if (!rx->afc_enabled || rx->carriers != 1U || rx->psk_family != PSK_FAMILY_8PSK || !valid ||
+    if (!rx->afc_enabled || rx->psk_family != PSK_FAMILY_8PSK || !valid ||
+        car >= rx->carriers || car >= MAX_PSK_CARRIERS ||
         !rx->sq_open || rx->sq_stable_symbols < SQ_EMIT_STABLE_SYMBOLS ||
         rx->symbol_period_samples <= 0.0f) {
         return;
@@ -1866,7 +1976,7 @@ static void update_8psk_nondat_afc(psk_rtty_rx_t *rx, float i, float q, int vali
 
     const float power = i * i + q * q;
     if (power <= 0.0025f) {
-        rx->psk8_eighth_valid = 0U;
+        rx->psk8_eighth_valid_carrier[car] = 0U;
         return;
     }
     const float inv_mag = 1.0f / sqrtf(power);
@@ -1876,14 +1986,18 @@ static void update_8psk_nondat_afc(psk_rtty_rx_t *rx, float i, float q, int vali
     const psk_rtty_complex_t z4 = {z2.x * z2.x - z2.y * z2.y, 2.0f * z2.x * z2.y};
     const psk_rtty_complex_t z8 = {z4.x * z4.x - z4.y * z4.y, 2.0f * z4.x * z4.y};
 
-    if (rx->psk8_eighth_valid) {
-        const float dot = rx->psk8_eighth_prev.x * z8.x + rx->psk8_eighth_prev.y * z8.y;
-        const float cross = rx->psk8_eighth_prev.x * z8.y - rx->psk8_eighth_prev.y * z8.x;
+    if (rx->psk8_eighth_valid_carrier[car]) {
+        const float dot = rx->psk8_eighth_prev_carrier[car].x * z8.x +
+                          rx->psk8_eighth_prev_carrier[car].y * z8.y;
+        const float cross = rx->psk8_eighth_prev_carrier[car].x * z8.y -
+                            rx->psk8_eighth_prev_carrier[car].y * z8.x;
         const float estimate = atan2f(cross, dot) / (8.0f * rx->symbol_period_samples);
         if (fabsf(estimate) <= rx->afc_limit) {
+            const uint8_t active = rx->carriers > 0U ? rx->carriers : 1U;
             const float filter = rx->debug_chars == 0U ? 0.08f : 0.02f;
-            const float gain = rx->debug_chars == 0U ? PSK8_NDA_ACQUIRE_GAIN :
-                                                       PSK8_NDA_TRACK_GAIN;
+            const float gain = (rx->debug_chars == 0U ? PSK8_NDA_ACQUIRE_GAIN :
+                                                        PSK8_NDA_TRACK_GAIN) /
+                               (float)active;
             rx->psk8_coarse_freq += filter * (estimate - rx->psk8_coarse_freq);
             rx->freq_error += gain * (rx->psk8_coarse_freq - rx->freq_error);
             if (rx->freq_error > rx->afc_limit) {
@@ -1891,14 +2005,16 @@ static void update_8psk_nondat_afc(psk_rtty_rx_t *rx, float i, float q, int vali
             } else if (rx->freq_error < -rx->afc_limit) {
                 rx->freq_error = -rx->afc_limit;
             }
-            const float phase_inc = rx->nco_phase_inc + rx->freq_error;
-            rx->carrier_rot_cos[0] = cosf(phase_inc);
-            rx->carrier_rot_sin[0] = sinf(phase_inc);
+            for (uint8_t index = 0U; index < active; ++index) {
+                const float phase_inc = rx->carrier_phase_inc[index] + rx->freq_error;
+                rx->carrier_rot_cos[index] = cosf(phase_inc);
+                rx->carrier_rot_sin[index] = sinf(phase_inc);
+            }
             rx->debug_coarse_updates++;
         }
     }
-    rx->psk8_eighth_prev = z8;
-    rx->psk8_eighth_valid = 1U;
+    rx->psk8_eighth_prev_carrier[car] = z8;
+    rx->psk8_eighth_valid_carrier[car] = 1U;
 }
 
 static uint8_t qpsk_soft_bit(float angle, uint8_t bit_mask)
@@ -1961,7 +2077,8 @@ static float channel_sync_energy(const psk_rtty_rx_t *rx)
     for (uint8_t car = 0; car < active; ++car) {
         const float i = rx->chan_bit_signal[car].x;
         const float q = rx->chan_bit_signal[car].y;
-        energy += i * i + q * q;
+        const float power = i * i + q * q;
+        energy += (rx->config.mode == PSK_RTTY_MODE_8PSK1200F || rx->config.mode == PSK_RTTY_MODE_2X8PSK1200F) ? sqrtf(power) : power;
     }
 
     return energy / (float)active;
@@ -2052,8 +2169,8 @@ static PSK_FAST_TEXT void finish_channel_psk_symbol(psk_rtty_rx_t *rx)
         const float mag = sqrtf(i * i + q * q);
 
         if (rx->carrier_has_prev[car]) {
-            if (rx->psk_family == PSK_FAMILY_8PSK && active == 1U) {
-                update_8psk_nondat_afc(rx, i, q, mag > 0.05f);
+            if (rx->psk_family == PSK_FAMILY_8PSK) {
+                update_8psk_nondat_afc(rx, car, i, q, mag > 0.05f);
             }
             const float pi = rx->carrier_i_prev[car];
             const float pq = rx->carrier_q_prev[car];

@@ -34,6 +34,7 @@ static uint16_t fec_8psk_flush_chars(psk_mode_t mode)
     case PSK_MODE_8PSK1000F:
         return 120U;
     case PSK_MODE_8PSK1200F:
+    case PSK_MODE_2X8PSK1200F:
         return 175U;
     default:
         return 0U;
@@ -49,6 +50,15 @@ static float wrap_phase(float phase)
         phase += (float)(2.0 * M_PI);
     }
     return phase;
+}
+
+static uint32_t highest_bit_mask(uint32_t value)
+{
+    uint32_t mask = 1UL << 31;
+    while (mask != 0U && (value & mask) == 0U) {
+        mask >>= 1U;
+    }
+    return mask;
 }
 
 static void set_symbol_transition(psk_tx_t *tx, uint8_t car, float target_phase)
@@ -92,6 +102,11 @@ static void reset_tx(psk_tx_t *tx)
     tx->fec_stream_puncture_phase = 0U;
     tx->fec_stream_warmup_bits_left = 0U;
     tx->fec_stream_state = 0U;
+    tx->stream_fetch = NULL;
+    tx->stream_user = NULL;
+    tx->stream_code = 0U;
+    tx->stream_mask = 0U;
+    tx->binary_stream = 0U;
 }
 
 static void load_mode(const psk_mode_info_t *info, psk_tx_t *tx, int32_t tone_hz)
@@ -109,7 +124,7 @@ static void load_mode(const psk_mode_info_t *info, psk_tx_t *tx, int32_t tone_hz
     tx->fec_poly2 = info->fec_poly2;
     tx->fec_flush_chars = fec_8psk_flush_chars(info->id);
     tx->fec_preamble_bits = 0U;
-    tx->tone_hz = tone_hz > 0 ? tone_hz : 1500;
+    tx->tone_hz = tone_hz > 0 ? tone_hz : PSK_DEFAULT_TONE_HZ;
     tx->symbol_period_samples = (float)tx->sample_rate_hz / info->baud;
     tx->symbol_samples = (uint32_t)(tx->symbol_period_samples + 0.5f);
     if (tx->symbol_samples == 0U) {
@@ -127,6 +142,17 @@ static void load_mode(const psk_mode_info_t *info, psk_tx_t *tx, int32_t tone_hz
         if (tx->amplitude_scale > peak_limited_scale) {
             tx->amplitude_scale = peak_limited_scale;
         }
+
+        /* PSK125C12 is a text mode.  Its twelve carriers were previously
+         * limited to 1/12 of the full-scale peak, which leaves too little
+         * per-carrier SNR after the WM8960 line path.  Keep the voice bridge
+         * modes unchanged and give this text mode modest extra headroom. */
+        if (info->id == PSK_MODE_12XPSK125) {
+            const float text_peak_scale = 3500.0f;
+            if (tx->amplitude_scale < text_peak_scale) {
+                tx->amplitude_scale = text_peak_scale;
+            }
+        }
     }
 
     const float spacing = 1.4f * info->baud;
@@ -134,7 +160,11 @@ static void load_mode(const psk_mode_info_t *info, psk_tx_t *tx, int32_t tone_hz
     for (uint8_t car = 0U; car < tx->carriers; ++car) {
         const float freq = first + (float)car * spacing;
         tx->carrier_step[car] = (float)(2.0 * M_PI * (double)freq / (double)tx->sample_rate_hz);
-        tx->carrier_phase[car] = 0.0f;
+        /* A zero-phase multitone produces a large coherent peak at startup.
+         * Newman quadratic phases lower the crest factor without changing
+         * any differential data phase, carrier frequency, or decoder rule. */
+        tx->carrier_phase[car] = tx->carriers > 1U ?
+            wrap_phase((float)M_PI * (float)car * (float)car / (float)tx->carriers) : 0.0f;
         tx->data_phase[car] = 0.0f;
         tx->phase_start[car] = 0.0f;
         tx->phase_target[car] = 0.0f;
@@ -152,11 +182,14 @@ static size_t build_raw_payload_stream(psk_tx_t *tx, const char *text,
     size_t raw_len = 0U;
     if (append_fec_preamble) {
         for (uint16_t i = 0U; i < tx->fec_preamble_bits; ++i) {
-            psk_codec_append_bit(s_tx_raw_bits, &raw_len, 0U);
+            const uint8_t bit = (tx->family == PSK_MODE_FAMILY_BPSK && tx->mfsk_varicode) ?
+                (uint8_t)((i & 1U) == 0U) : 0U;
+            psk_codec_append_bit(s_tx_raw_bits, &raw_len, bit);
         }
     }
     if (tx->mfsk_varicode) {
-        if (tx->family == PSK_MODE_FAMILY_8PSK) {
+        if (tx->family == PSK_MODE_FAMILY_8PSK ||
+            (tx->family == PSK_MODE_FAMILY_BPSK && tx->fec)) {
             psk_codec_append_mfsk_char(s_tx_raw_bits, &raw_len, 0U);
         }
         psk_codec_append_mfsk_text(s_tx_raw_bits, &raw_len, text);
@@ -165,9 +198,20 @@ static size_t build_raw_payload_stream(psk_tx_t *tx, const char *text,
             for (uint16_t i = 0U; i < flush_chars; ++i) {
                 psk_codec_append_mfsk_char(s_tx_raw_bits, &raw_len, 0U);
             }
+        } else if (append_fec_flush && tx->family == PSK_MODE_FAMILY_BPSK && tx->fec) {
+            /* fldigi::tx_flush sends dcdbits/2 pairs of input 1,1 for
+             * PSK63F, allowing the decoder traceback to drain. */
+            for (uint16_t i = 0U; i < tx->fec_preamble_bits; ++i) {
+                psk_codec_append_bit(s_tx_raw_bits, &raw_len, 1U);
+            }
         }
     } else {
         psk_codec_append_varicode_text(s_tx_raw_bits, &raw_len, text);
+        if (append_fec_flush && tx->family == PSK_MODE_FAMILY_QPSK) {
+            for (uint16_t i = 0U; i < tx->preamble_symbols; ++i) {
+                psk_codec_append_bit(s_tx_raw_bits, &raw_len, 0U);
+            }
+        }
     }
 
     return raw_len;
@@ -252,8 +296,48 @@ static size_t build_payload_stream(psk_tx_t *tx, uint8_t repeat_payload)
 static uint8_t take_raw_payload_bit(psk_tx_t *tx, uint8_t *bit)
 {
     if (tx->fec_stream_warmup_bits_left > 0U) {
+        /* fldigi's BPSK63F preamble is 32 repetitions of input bits 1,0
+         * before the MFSK NUL marker.  The 8PSK FEC modes retain their
+         * existing zero warmup sequence. */
+        if (tx->family == PSK_MODE_FAMILY_BPSK && tx->mfsk_varicode) {
+            *bit = (tx->fec_stream_warmup_bits_left & 1U) == 0U ? 1U : 0U;
+        } else {
+            *bit = 0U;
+        }
         --tx->fec_stream_warmup_bits_left;
-        *bit = 0U;
+        return 1U;
+    }
+    if (tx->stream_fetch) {
+        if (tx->binary_stream) {
+            if (tx->stream_mask == 0U) {
+                int ch = tx->stream_fetch(tx->stream_user);
+                if (ch < 0) {
+                    ch = 0;
+                }
+                tx->stream_code = (uint32_t)(uint8_t)ch;
+                tx->stream_mask = 0x80U;
+            }
+            *bit = (tx->stream_code & tx->stream_mask) ? 1U : 0U;
+            tx->stream_mask >>= 1U;
+            return 1U;
+        }
+        while (tx->stream_mask == 0U) {
+            int ch = tx->stream_fetch(tx->stream_user);
+            if (ch < 0) {
+                ch = 'X';
+            }
+            if (tx->mfsk_varicode) {
+                tx->stream_code = psk_codec_mfsk_varicode_table()[(uint8_t)ch];
+            } else {
+                /* Standard PSK Varicode uses two zero bits as the character
+                 * separator. Appending them to the code makes continuous
+                 * callback streams behave exactly like buffered text. */
+                tx->stream_code = psk_codec_varicode_code((uint8_t)ch) << 2U;
+            }
+            tx->stream_mask = highest_bit_mask(tx->stream_code);
+        }
+        *bit = (tx->stream_code & tx->stream_mask) ? 1U : 0U;
+        tx->stream_mask >>= 1U;
         return 1U;
     }
     if (tx->payload_pos >= tx->payload_len) {
@@ -327,6 +411,9 @@ static uint8_t take_payload_bit(psk_tx_t *tx, uint8_t *bit)
     if (tx->fec_stream) {
         return take_fec_stream_bit(tx, bit);
     }
+    if (tx->stream_fetch) {
+        return take_raw_payload_bit(tx, bit);
+    }
     if (tx->payload_pos >= tx->payload_len) {
         if (!tx->repeat_payload || tx->payload_len == 0U) {
             return 0U;
@@ -357,10 +444,12 @@ static uint8_t load_symbol(psk_tx_t *tx, uint8_t *values, uint8_t *count)
                 /* fldigi disables FEC for the first half of the 8PSK FEC
                  * preamble and sends non-FEC symbol 0. With this Gray map,
                  * symbol 6 produces the same 180 degree differential phase. */
-                values[0] = 0U;
-                values[1] = 1U;
-                values[2] = 1U;
-                *count = tx->bits_per_symbol;
+                for (uint8_t car = 0U; car < tx->carriers; ++car) {
+                    values[car * tx->bits_per_symbol + 0U] = 0U;
+                    values[car * tx->bits_per_symbol + 1U] = 1U;
+                    values[car * tx->bits_per_symbol + 2U] = 1U;
+                }
+                *count = (uint8_t)(tx->bits_per_symbol * tx->carriers);
                 return 1U;
             }
             for (uint8_t i = 0U; i < tx->carriers; ++i) {
@@ -385,6 +474,20 @@ static uint8_t load_symbol(psk_tx_t *tx, uint8_t *values, uint8_t *count)
             *count = tx->carriers;
             return 1U;
         }
+        if (tx->family == PSK_MODE_FAMILY_8PSK && tx->carriers > 1U) {
+            for (uint8_t car = 0U; car < tx->carriers; ++car) {
+                for (uint8_t bit_idx = 0U; bit_idx < tx->bits_per_symbol; ++bit_idx) {
+                    uint8_t bit = 0U;
+                    if (!take_payload_bit(tx, &bit)) {
+                        tx->stage = PSK_TX_STAGE_POSTAMBLE;
+                        return load_symbol(tx, values, count);
+                    }
+                    values[(size_t)car * tx->bits_per_symbol + bit_idx] = bit;
+                }
+            }
+            *count = (uint8_t)(tx->bits_per_symbol * tx->carriers);
+            return 1U;
+        }
 
         const uint8_t bits_needed = tx->bits_per_symbol;
         for (uint8_t i = 0U; i < bits_needed; ++i) {
@@ -404,10 +507,13 @@ static uint8_t load_symbol(psk_tx_t *tx, uint8_t *values, uint8_t *count)
             --tx->postamble_left;
             if (tx->family == PSK_MODE_FAMILY_8PSK) {
                 const uint8_t idle_symbol = tx->fec ? 0U : 4U;
-                for (uint8_t i = 0U; i < tx->bits_per_symbol; ++i) {
-                    values[i] = (uint8_t)((idle_symbol >> i) & 1U);
+                for (uint8_t car = 0U; car < tx->carriers; ++car) {
+                    for (uint8_t i = 0U; i < tx->bits_per_symbol; ++i) {
+                        values[(size_t)car * tx->bits_per_symbol + i] =
+                            (uint8_t)((idle_symbol >> i) & 1U);
+                    }
                 }
-                *count = tx->bits_per_symbol;
+                *count = (uint8_t)(tx->bits_per_symbol * tx->carriers);
                 return 1U;
             } else {
                 for (uint8_t i = 0U; i < tx->carriers; ++i) {
@@ -432,7 +538,7 @@ void psk_tx_init(psk_tx_t *tx, uint32_t sample_rate_hz)
     }
     memset(tx, 0, sizeof(*tx));
     tx->sample_rate_hz = sample_rate_hz;
-    tx->tone_hz = 1500;
+    tx->tone_hz = PSK_DEFAULT_TONE_HZ;
     tx->symbol_samples = sample_rate_hz / 31U;
     if (tx->symbol_samples == 0U) {
         tx->symbol_samples = 1U;
@@ -462,6 +568,9 @@ static int start_text(psk_tx_t *tx, psk_mode_t mode, int32_t tone_hz,
     if (tx->fec && tx->family == PSK_MODE_FAMILY_8PSK) {
         tx->fec_preamble_bits = tx->preamble_symbols;
         tx->preamble_symbols /= 2U;
+    } else if (tx->fec && tx->family == PSK_MODE_FAMILY_BPSK && tx->mfsk_varicode) {
+        tx->fec_preamble_bits = tx->preamble_symbols;
+        tx->preamble_symbols = 0U;
     }
     tx->postamble_symbols = (tx->fec && tx->family == PSK_MODE_FAMILY_8PSK) ?
         0U : tx->preamble_symbols;
@@ -492,6 +601,120 @@ int psk_tx_start_text_loop(psk_tx_t *tx, psk_mode_t mode, int32_t tone_hz,
     return start_text(tx, mode, tone_hz, text, 1U);
 }
 
+int psk_tx_start_stream(psk_tx_t *tx, psk_mode_t mode, int32_t tone_hz,
+                        psk_tx_stream_fetch_cb_t fetch, void *user)
+{
+    if (!tx || !fetch) {
+        return -1;
+    }
+
+    const psk_mode_info_t *info = psk_mode_info(mode);
+    if (!info || info->baud <= 0.0f || info->bits_per_symbol == 0U || info->carriers == 0U) {
+        return -2;
+    }
+
+    reset_tx(tx);
+    load_mode(info, tx, tone_hz);
+    tx->preamble_symbols = info->dcd_bits ? info->dcd_bits : 32U;
+    if (tx->fec && tx->family == PSK_MODE_FAMILY_8PSK) {
+        tx->fec_preamble_bits = tx->preamble_symbols;
+        tx->preamble_symbols /= 2U;
+    } else if (tx->fec && tx->family == PSK_MODE_FAMILY_BPSK && tx->mfsk_varicode) {
+        tx->fec_preamble_bits = tx->preamble_symbols;
+        tx->preamble_symbols = 0U;
+    }
+    tx->postamble_symbols = 0U;
+    tx->repeat_payload = 1U;
+    tx->fec_stream = tx->fec ? 1U : 0U;
+    tx->fec_stream_state = 0U;
+    tx->fec_stream_out_len = 0U;
+    tx->fec_stream_out_pos = 0U;
+    tx->fec_stream_puncture_phase = 0U;
+    tx->fec_stream_warmup_bits_left = tx->fec_preamble_bits;
+    tx->stream_fetch = fetch;
+    tx->stream_user = user;
+    tx->stream_code = 0U;
+    tx->stream_mask = 0U;
+    if (tx->mfsk_varicode) {
+        tx->stream_code = psk_codec_mfsk_varicode_table()[0U];
+        tx->stream_mask = highest_bit_mask(tx->stream_code);
+    }
+    psk_codec_interleave2_reset(s_tx_interleave_table, sizeof(s_tx_interleave_table));
+    tx->preamble_left = tx->preamble_symbols;
+    tx->postamble_left = tx->postamble_symbols;
+    tx->stage = PSK_TX_STAGE_PREAMBLE;
+    tx->active = 1U;
+    tx->symbol_position = tx->symbol_period_samples;
+    return 0;
+}
+
+int psk_tx_start_binary_stream(psk_tx_t *tx, psk_mode_t mode, int32_t tone_hz,
+                               psk_tx_stream_fetch_cb_t fetch, void *user)
+{
+    const int rc = psk_tx_start_stream(tx, mode, tone_hz, fetch, user);
+    if (rc == 0) {
+        tx->binary_stream = 1U;
+        /* Raw bytes must not inherit the text Varicode start marker. */
+        tx->stream_code = 0U;
+        tx->stream_mask = 0U;
+    }
+    return rc;
+}
+
+int psk_tx_start_binary_data(psk_tx_t *tx, psk_mode_t mode, int32_t tone_hz,
+                             const uint8_t *data, size_t length)
+{
+    if (!tx || !data || length == 0U) {
+        return -1;
+    }
+
+    const psk_mode_info_t *info = psk_mode_info(mode);
+    if (!info || info->baud <= 0.0f || info->bits_per_symbol == 0U || info->carriers == 0U) {
+        return -2;
+    }
+
+    reset_tx(tx);
+    load_mode(info, tx, tone_hz);
+    tx->preamble_symbols = info->dcd_bits ? info->dcd_bits : 32U;
+    if (tx->fec && tx->family == PSK_MODE_FAMILY_8PSK) {
+        tx->fec_preamble_bits = tx->preamble_symbols;
+        tx->preamble_symbols /= 2U;
+    }
+    tx->postamble_symbols = 0U;
+
+    size_t raw_len = 0U;
+    for (uint16_t i = 0U; i < tx->fec_preamble_bits; ++i) {
+        psk_codec_append_bit(s_tx_raw_bits, &raw_len, 0U);
+    }
+    for (size_t pos = 0U; pos < length; ++pos) {
+        for (int bit = 7; bit >= 0; --bit) {
+            psk_codec_append_bit(s_tx_raw_bits, &raw_len,
+                                 (uint8_t)((data[pos] >> bit) & 1U));
+        }
+    }
+    if (tx->fec && tx->family == PSK_MODE_FAMILY_8PSK) {
+        const uint16_t flush_chars = tx->fec_flush_chars ? tx->fec_flush_chars : 32U;
+        for (uint16_t i = 0U; i < (uint16_t)(flush_chars * 8U); ++i) {
+            psk_codec_append_bit(s_tx_raw_bits, &raw_len, 0U);
+        }
+    }
+
+    const size_t payload_len = build_encoded_payload_stream(tx, raw_len);
+    if (payload_len == 0U) {
+        return -3;
+    }
+
+    tx->payload_len = payload_len;
+    tx->payload_pos = 0U;
+    tx->preamble_left = tx->preamble_symbols;
+    tx->postamble_left = tx->postamble_symbols;
+    tx->stage = PSK_TX_STAGE_PREAMBLE;
+    tx->active = 1U;
+    tx->symbol_position = tx->symbol_period_samples;
+    tx->binary_stream = 1U;
+    return 0;
+}
+
 size_t psk_tx_generate(psk_tx_t *tx, int16_t *out, size_t capacity)
 {
     if (!tx || !out || capacity == 0U || !tx->active) {
@@ -508,19 +731,28 @@ size_t psk_tx_generate(psk_tx_t *tx, int16_t *out, size_t capacity)
             }
             tx->symbol_position -= tx->symbol_period_samples;
 
-            if (tx->family == PSK_MODE_FAMILY_BPSK && tx->carriers > 1U) {
-                for (uint8_t car = 0U; car < tx->carriers; ++car) {
-                    float target_phase = tx->data_phase[car];
-                    if (bits[car] == 0U) {
-                        target_phase += (float)M_PI;
-                    }
-                    set_symbol_transition(tx, car, target_phase);
+        if (tx->family == PSK_MODE_FAMILY_BPSK && tx->carriers > 1U) {
+            for (uint8_t car = 0U; car < tx->carriers; ++car) {
+                float target_phase = tx->data_phase[car];
+                if (bits[car] == 0U) {
+                    target_phase += (float)M_PI;
                 }
-            } else {
-                const uint8_t symbol = bits_to_symbol(tx, bits, count);
+                set_symbol_transition(tx, car, target_phase);
+            }
+        } else if (tx->family == PSK_MODE_FAMILY_8PSK && tx->carriers > 1U) {
+            for (uint8_t car = 0U; car < tx->carriers; ++car) {
+                const uint8_t symbol = bits_to_symbol(tx,
+                                                       &bits[(size_t)car * tx->bits_per_symbol],
+                                                       tx->bits_per_symbol);
                 const float phase_delta = psk_codec_phase_delta((psk_mode_family_t)tx->family,
-                                                               tx->fec, symbol);
-                set_symbol_transition(tx, 0U, tx->data_phase[0] + phase_delta);
+                                                                tx->fec, symbol);
+                set_symbol_transition(tx, car, tx->data_phase[car] + phase_delta);
+            }
+        } else {
+            const uint8_t symbol = bits_to_symbol(tx, bits, count);
+            const float phase_delta = psk_codec_phase_delta((psk_mode_family_t)tx->family,
+                                                           tx->fec, symbol);
+            set_symbol_transition(tx, 0U, tx->data_phase[0] + phase_delta);
             }
         }
 

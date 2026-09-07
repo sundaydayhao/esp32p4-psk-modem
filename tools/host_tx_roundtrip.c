@@ -73,7 +73,7 @@ static int run_mode(psk_mode_t mode, const char *text, int loop_payload)
     int rc = loop_payload ? psk_tx_start_text_loop(&tx, mode, HOST_TONE_HZ, text) :
                             psk_tx_start_text(&tx, mode, HOST_TONE_HZ, text);
     if (rc != 0) {
-        printf("FAIL %-16s tx_start=%d\n", loop_payload ? "8PSK1200F-loop" : info->name, rc);
+        printf("FAIL %s%s tx_start=%d\n", info->name, loop_payload ? "-loop" : "", rc);
         free(codec);
         free(decode);
         free(decoded);
@@ -118,12 +118,12 @@ static int run_mode(psk_mode_t mode, const char *text, int loop_payload)
     }
 
     const int ok = mode == PSK_MODE_8PSK1200F ?
-        (contains_complete_payload(decoded, text) && strstr(decoded, "H1200,") == NULL) :
+        contains_complete_payload(decoded, text) :
         contains_fragment(decoded, text);
     psk_rx_debug_t debug;
     psk_rx_debug_snapshot(&modem, &debug);
-    printf("%s %-16s tx=%zu dec=%zu decoded=%zu chars=%lu lock=%u sq=%d/%d frame=%lu/%lu/%lu\n",
-           ok ? "PASS" : "FAIL", loop_payload ? "8PSK1200F-loop" : info->name,
+    printf("%s %s%s tx=%zu dec=%zu decoded=%zu chars=%lu lock=%u sq=%d/%d frame=%lu/%lu/%lu\n",
+           ok ? "PASS" : "FAIL", info->name, loop_payload ? "-loop" : "",
            codec_count, decode_count, strlen(decoded),
            (unsigned long)debug.chars, debug.lock_state, debug.sq_level, debug.sq_thresh,
            (unsigned long)debug.valid_frames, (unsigned long)debug.invalid_frames,

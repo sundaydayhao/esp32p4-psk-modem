@@ -1,0 +1,12 @@
+menu "PSK receiver hotspot"
+    config PSK_AP_SSID
+        string "Wi-Fi hotspot name"
+        default "ESP32P4-PSK"
+    config PSK_AP_PASSWORD
+        string "WPA2 password (8 to 63 characters)"
+        default "pskmodem32"
+    config PSK_AP_CHANNEL
+        int "Wi-Fi channel"
+        range 1 13
+        default 6
+endmenu

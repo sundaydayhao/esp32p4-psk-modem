@@ -6,8 +6,10 @@
 #include "psk_modes.h"
 
 #define PSK_TX_TEXT_MAX   256U
-#define PSK_TX_BIT_MAX    16384U
+#define PSK_TX_BIT_MAX    32768U
 #define PSK_TX_CARRIER_MAX 12U
+
+typedef int (*psk_tx_stream_fetch_cb_t)(void *user);
 
 typedef struct {
     uint32_t sample_rate_hz;
@@ -45,6 +47,11 @@ typedef struct {
     uint32_t fec_stream_state;
     uint32_t fec_poly1;
     uint32_t fec_poly2;
+    psk_tx_stream_fetch_cb_t stream_fetch;
+    void *stream_user;
+    uint32_t stream_code;
+    uint32_t stream_mask;
+    uint8_t binary_stream;
     uint8_t payload_bits[PSK_TX_BIT_MAX];
     size_t payload_len;
     size_t payload_pos;
@@ -66,6 +73,12 @@ int psk_tx_start_text(psk_tx_t *tx, psk_mode_t mode, int32_t tone_hz,
                       const char *text);
 int psk_tx_start_text_loop(psk_tx_t *tx, psk_mode_t mode, int32_t tone_hz,
                            const char *text);
+int psk_tx_start_stream(psk_tx_t *tx, psk_mode_t mode, int32_t tone_hz,
+                        psk_tx_stream_fetch_cb_t fetch, void *user);
+int psk_tx_start_binary_stream(psk_tx_t *tx, psk_mode_t mode, int32_t tone_hz,
+                               psk_tx_stream_fetch_cb_t fetch, void *user);
+int psk_tx_start_binary_data(psk_tx_t *tx, psk_mode_t mode, int32_t tone_hz,
+                             const uint8_t *data, size_t length);
 size_t psk_tx_generate(psk_tx_t *tx, int16_t *out, size_t capacity);
 int psk_tx_active(const psk_tx_t *tx);
 void psk_tx_stop(psk_tx_t *tx);

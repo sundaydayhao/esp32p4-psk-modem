@@ -1,3 +1,7 @@
 dependencies:
   espressif/esp32_p4_function_ev_board:
     version: "5.2.3"
+  espressif/esp_wifi_remote:
+    version: ">=0.10,<2.0"
+  espressif/esp_hosted:
+    version: "~2"

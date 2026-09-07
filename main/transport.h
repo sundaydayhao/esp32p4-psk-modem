@@ -17,3 +17,6 @@ esp_err_t transport_set_mode(transport_mode_t mode);
 transport_mode_t transport_get_mode(void);
 const char *transport_mode_name(transport_mode_t mode);
 void transport_send(const uint8_t *data, size_t len);
+size_t transport_read(uint64_t *cursor, uint8_t *out, size_t capacity, uint64_t *lost);
+uint64_t transport_received_bytes(void);
+uint64_t transport_usb_dropped_bytes(void);

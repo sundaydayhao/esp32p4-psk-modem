@@ -68,6 +68,11 @@ const uint32_t *psk_codec_mfsk_varicode_table(void)
     return s_mfsk_varicode_encode;
 }
 
+uint32_t psk_codec_varicode_code(uint8_t ch)
+{
+    return (uint32_t)VARICODE_TABLE[ch];
+}
+
 static void append_bits_from_code(uint8_t *bits, size_t *len, uint32_t code)
 {
     uint32_t mask = highest_bit_mask(code);

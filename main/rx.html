@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark light"><title>PSK 接收台</title>
+<style>
+:root{font:16px/1.6 system-ui,sans-serif;color:#e4edf2;background:#101923;color-scheme:dark}
+*{box-sizing:border-box}body{max-width:960px;margin:auto;padding:24px 18px}header{display:flex;align-items:center;justify-content:space-between;gap:16px}h1{font-size:26px;margin:4px 0}.sub{color:#9fb0bf;font-size:14px}#connection{font-size:13px;color:#58dcc0;white-space:nowrap}.panel{background:#192634;border:1px solid #304152;border-radius:14px;padding:18px;margin:18px 0}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.metric strong{display:block;font-size:21px;color:#e4edf2}.metric span{font-size:12px;color:#9fb0bf}form{display:flex;align-items:end;gap:12px;flex-wrap:wrap}label{font-size:13px;color:#b4c4d1}select,input,button{font:inherit;border:1px solid #425568;border-radius:8px;padding:10px;background:#101923;color:#e4edf2}select,input{display:block;margin-top:6px;width:100%}input{max-width:150px}button{cursor:pointer;background:#277d71;border-color:#398b80;font-size:14px}button.secondary{background:transparent;border-color:#425568}button:disabled{opacity:.5}.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:space-between}.actions h2{font-size:16px;margin:0}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:15px/1.7 ui-monospace,monospace;min-height:220px;max-height:55vh;overflow:auto;margin-bottom:0}#notice{color:#ffce88;min-height:24px;font-size:13px}#diag{font-size:12px;color:#9fb0bf;overflow-wrap:anywhere}a{color:#58dcc0}@media(max-width:480px){body{padding:16px 12px}.metrics{gap:8px}.metric strong{font-size:17px}header{align-items:start}#connection{max-width:100px;white-space:normal}form label:first-child{width:100%}}
+</style>
+<header><div><div class="sub">ESP32-P4 · AUDIO MODEM</div><h1>PSK 接收台</h1><div class="sub">连接板子热点，即可在这里阅读收到的内容。</div></div><div id="connection" role="status">正在连接…</div></header>
+<section class="panel metrics"><div class="metric"><span>当前接收模式</span><strong id="current">—</strong></div><div class="metric"><span>中心频率</span><strong id="frequency">—</strong></div><div class="metric"><span>解调负载</span><strong id="load">—</strong></div></section>
+<section class="panel"><form id="config"><label>接收模式<select id="mode" required></select></label><label>中心频率 / Hz<input id="tone" type="number" min="100" max="3500" step="1" value="2000" required></label><button id="apply" disabled>应用到接收机</button></form><div id="notice" role="status"></div><div id="diag">等待接收机状态</div></section>
+<section class="panel"><div class="actions"><h2>接收内容 <span id="count" class="sub"></span></h2><div><button id="pause" class="secondary">暂停显示</button> <button id="clear" class="secondary">清空本页</button> <button id="save" class="secondary">保存文本</button></div></div><pre id="text" aria-label="接收文本"></pre></section>
+<p class="sub">手机提示“此 Wi-Fi 无法访问互联网”时，请选择继续连接。页面不需要外网。板子保存最近 16 KiB 接收数据，本页最多保留 64 KiB 字符。速率为理论信息位速率，实际文本吞吐还需扣除字符编码及前导开销。</p>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+let cursor='0',boot='',paused=false,content='',pending=false,editing=false,modesReady=false;
+function append(text){content=(content+text).slice(-65536);$('text').textContent=content;$('text').scrollTop=$('text').scrollHeight;}
+async function request(url,options={}){const ctrl=new AbortController();const timer=setTimeout(()=>ctrl.abort(),5000);try{const r=await fetch(url,{...options,cache:'no-store',signal:ctrl.signal});if(!r.ok)throw new Error('HTTP '+r.status);const body=await r.arrayBuffer();return new Response(body,{status:r.status,headers:r.headers});}finally{clearTimeout(timer);}}
+function setBoot(id){if(boot&&boot!==id){cursor='0';append('\n[接收机已重启]\n');}boot=id;}
+async function poll(){let delay=300;try{
+  if(!modesReady){const modes=await(await request('/api/modes')).json();for(const m of modes){const o=document.createElement('option');o.value=m.id;o.textContent=m.name;$('mode').append(o);}modesReady=true;$('apply').disabled=false;}
+  const s=await(await request('/api/status')).json();setBoot(s.boot_id);
+  $('connection').textContent=paused?'已连接 · 显示暂停':'已连接 · '+(s.lock_state===3?'信号锁定':'等待信号');
+  $('current').textContent=s.mode;$('frequency').textContent=s.tone_hz+' Hz';$('load').textContent=s.dsp_load_percent.toFixed(1)+'%';$('count').textContent=s.received_bytes+' B';
+  $('diag').textContent='每载波 '+s.baud.toFixed(2)+' Baud · '+s.carriers+' 载波 · '+s.information_bps.toFixed(1)+' bit/s · 采样 '+s.samples_per_second+'/s · 最慢解调块 '+s.dsp_max_us+'/'+s.block_budget_us+' μs · 累计超预算 '+s.deadline_misses+' · 读错误 '+s.read_errors;
+  if(!editing&&!pending){$('mode').value=s.mode_id;$('tone').value=s.tone_hz;}
+  if(!paused){const r=await request('/api/rx?cursor='+cursor);const id=r.headers.get('X-Boot-Id');if(id!==boot){setBoot(id);delay=20;}else{
+    const bytes=new Uint8Array(await r.arrayBuffer());const lost=r.headers.get('X-Lost-Bytes');if(lost!=='0')append('\n[历史缓冲已覆盖 '+lost+' 字节]\n');
+    let text='';for(const b of bytes)text+=(b===9||b===10||b===13||b>=32&&b<=126)?String.fromCharCode(b):'\\x'+b.toString(16).padStart(2,'0');
+    cursor=r.headers.get('X-Next-Cursor');if(text)append(text);if(bytes.length===1024)delay=20;
+  }}
+}catch(e){$('connection').textContent='连接中断 · 正在重试';delay=1500;}finally{setTimeout(poll,delay);}}
+$('mode').onchange=()=>{editing=true;if($('mode').selectedOptions[0].textContent==='2x8PSK1200F'){$('tone').value=2000;$('notice').textContent='双载波模式建议两端使用 2000 Hz，链路需覆盖约 0–4 kHz 音频。';}};
+$('tone').oninput=()=>{editing=true;};
+$('config').onsubmit=async e=>{e.preventDefault();pending=true;$('apply').disabled=true;try{await request('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:Number($('mode').value),tone_hz:Number($('tone').value)})});$('notice').textContent='已排队，当前状态将在接收机应用后更新。';editing=false;}catch(e){$('notice').textContent='设置失败，请检查连接后重试。';}finally{pending=false;$('apply').disabled=false;}};
+$('pause').onclick=()=>{paused=!paused;$('pause').textContent=paused?'继续显示':'暂停显示';};
+$('clear').onclick=()=>{content='';$('text').textContent='';};
+$('save').onclick=()=>{const url=URL.createObjectURL(new Blob([content],{type:'text/plain;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download='psk-received.txt';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
+poll();
+</script></html>

@@ -1,91 +1,49 @@
-# ESP32-P4 多模式数字解调器
+# ESP32-P4 PSK 接收机
 
-这是一个 ESP-IDF 项目，用 ESP32-P4 Function EV Board 实现音频输入数字模式接收和解码。工程保留 ESP32-S3/HPM 参考工程的 modem/host 测试核心，并把板级显示、音频和内存布局移植到 ESP32-P4 BSP。
+基于 ESP32-P4 Function EV Board（板载 ESP32-C6）、ESP-IDF 5.5.5。参考 `C:/projects/hpm6750-psk-modem`，支持 28 种 PSK/QPSK/8PSK 模式、音频收发、LCD 频谱/文本和手机 AP 网页。
 
-更详细的架构图和模块划分见 [arch.md](arch.md)。
+## 速率结论
 
-## 当前功能
+本次最高通过理想信道完整载荷测试的模式是 **2x8PSK1200F**：每载波 **1230.769 Baud**，双载波 FEC 后 **4923.077 bit/s**。单载波无 FEC 的 **8PSK1000** 为 **3000 bit/s**。二者都是信息位速率，不是文本或文件净吞吐。
 
-当前 UI/串口命令入口对齐 HPM6750 工程，使用 PSK/QPSK/8PSK 模式：
+4096 字节完整校验已通过；P4 尚未接串口，**板上实时性能及实际零误码上限尚未测量**。双载波在 ±20 Hz 频偏测试中仍有错误。完整计算、测试条件、内存结果和限制见 [速率与 AP 评估](docs/RATE_AND_AP_2026-09-07.md)。
 
-- BPSK31
-- PSK63 及扩展 PSK/QPSK/8PSK 模式
+## 手机使用
 
-主要功能：
+1. 烧录 P4 固件，上电后连接热点 **ESP32P4-PSK**，密码 **pskmodem32**。
+2. 浏览器打开 **http://192.168.4.1/**；手机提示无互联网时选择继续连接。
+3. 页面设置与发射端相同的接收模式和中心频率；默认 BPSK31 / **2000 Hz**。双载波模式使用 2000 Hz 起测。
+4. 页面显示接收文本及解调状态，可暂停显示、清空本页、保存文本。无需路由器或外网。
 
-- 统一 PSK 解码入口：所有音频进入 `modem_process()` / `decoder_layer_feed()`。
-- PSK：`components/psk_rtty`，host 回归覆盖 27 个 PSK/QPSK/8PSK 模式。
-- 显示：通过 ESP32-P4 BSP/LVGL 显示频谱、瀑布图和解码文本。
-- 音频：通过 ESP32-P4 BSP `esp_codec_dev` 麦克风路径采样，48 kHz 输入按 HPM6750 逻辑直接进入 modem 处理。
-- 输出：USB 串口可用；WiFi 在 ESP32-P4 上不可用；BT 入口保留但未实现 BLE/SPP 后端。
+网页默认与 USB 文本输出同时启用；历史环形缓冲为 16 KiB。页面显示 ASCII，其他字节显示为 `\xNN`，原始 API 保留二进制。BT 后端未实现。
 
-## 架构概览
+ESP32-P4 本体没有 Wi-Fi；本项目通过板载 C6 / SDIO / ESP-Hosted 实现 AP。C6 需要兼容的 ESP-Hosted 固件，本项目提供匹配版本的构建脚本。
 
-```text
-ESP32-P4 BSP microphone / I2S
-    -> audio_input.c
-    -> rx_modem.c
-    -> rx_decoder.c
-    -> mode backend
-    -> decoded bytes
-    -> transport.c
-```
-
-核心文件：
-
-- `main/audio_input.c`：ESP32-P4 BSP 麦克风输入、采样和抽取。
-- `main/display.c`：ESP32-P4 BSP/LVGL 显示、瀑布图和触摸调谐。
-- `main/rx_modem.c`：公开 modem API、模式切换、频点设置和输出缓冲。
-- `main/rx_decoder.c`：统一解码层，按模式 family 分发到后端。
-- `components/psk_rtty`：PSK 后端。
-
-## 硬件默认配置
-
-- 目标芯片：`esp32p4`
-- 目标板：ESP32-P4 Function EV Board BSP
-- Codec 输入采样率：`BOARD_CODEC_SAMPLE_RATE_HZ = 48000`
-- Modem 处理采样率：`BOARD_MODEM_SAMPLE_RATE_HZ = 48000`
-- 瀑布图显示流：8 kHz / 512 samples / 8192 FFT / 0-3000 Hz
-- I2S/I2C/LCD/触摸：使用 BSP 定义的 P4 Function EV Board 引脚
-- 用户按键：GPIO0，用于循环切换模式
-
-PSK FEC/Viterbi 大表使用 `EXT_RAM_BSS_ATTR` 放入 PSRAM，`sdkconfig.defaults` 已启用 `CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y`。
-
-## 构建
-
-在 ESP-IDF v5.5.5 PowerShell 环境中构建：
+## 构建与烧录
 
 ```powershell
-C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe -NoExit -ExecutionPolicy Bypass -NoProfile -Command "& {. 'C:\Espressif\tools\Microsoft.v5.5.5.PowerShell_profile.ps1'}"
-idf.py -B build set-target esp32p4
-idf.py -B build build
+powershell -ExecutionPolicy Bypass -File tools/run_idf_build.ps1
+# 需要更新 C6 时，先构建匹配固件
+powershell -ExecutionPolicy Bypass -File tools/build_c6_firmware.ps1
+# 接板后显式填写当前 P4 串口；COM15 是历史端口示例
+powershell -ExecutionPolicy Bypass -File tools/flash_board.ps1 -Chip P4 -Port COM15
 ```
 
-固件产物和 host 工具都统一生成在 `build` 目录下。
+- P4 产物：`build/psk_modem_p4.bin`，配套 bootloader、partition table、flash_args 位于 `build/`。
+- C6 产物：`build/c6/network_adapter.bin`，配套文件位于 `build/c6/`；C6 使用独立编程接口，不能把 P4 USB 串口当作 C6 串口。
+- 调整热点：`idf.py menuconfig` → `PSK receiver hotspot`。
+- 自定义分区：partition table `0x10000`，factory app `0x20000`，容量 4 MiB。
+- 芯片/板型和 C6 烧录注意事项见评估文档。
 
-## Host 回归
+## 验证
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\build_host_tools.ps1
-powershell -ExecutionPolicy Bypass -File .\tools\run_host_regression.ps1 -WavDir C:\projects\psk-script\generated-wav-48000 -Expected C:\projects\psk-script\input.txt
+powershell -ExecutionPolicy Bypass -File tools/build_host_tools.ps1
+$env:PATH = 'C:/cygwin64/bin;' + $env:PATH
+build/host-tools/host_tx_roundtrip.exe
+powershell -ExecutionPolicy Bypass -File tools/run_rate_checks.ps1
 ```
 
-当前 WAV 回归结果与 HPM6750 工程一致：`PASS=26 FAIL=1 NO-WAV=0 TOTAL=27`，唯一失败项为 `2xPSK1000` 语料匹配。TX/RX roundtrip 结果：`failures=0`。
+现有回环覆盖 28 模式及 3 个循环场景，多数采用片段匹配；严格速率检查独立验证 5 个高速模式的完整 4096 字节载荷。PC 运行耗时不是 ESP32-P4 CPU 耗时，也不是实物链路 BER。
 
-## 烧录
-
-```powershell
-idf.py -B build -p COMx flash monitor
-```
-
-将 `COMx` 替换为实际串口号。
-
-## 分区
-
-项目使用自定义 `partitions.csv`：
-
-- partition table offset：`0x10000`
-- factory app offset：`0x20000`
-- factory app size：`0x400000`
-
-该布局适配 ESP32-P4 bootloader 体积和当前 modem/LVGL/BSP 固件大小。
+架构与任务分工见 [arch.md](arch.md)。

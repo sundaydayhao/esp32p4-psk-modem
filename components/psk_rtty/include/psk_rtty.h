@@ -33,6 +33,7 @@ typedef enum {
     PSK_RTTY_MODE_8PSK500F,
     PSK_RTTY_MODE_8PSK1000F,
     PSK_RTTY_MODE_8PSK1200F,
+    PSK_RTTY_MODE_2X8PSK1200F,
     PSK_RTTY_MODE_COUNT
 } psk_rtty_mode_t;
 
@@ -79,6 +80,8 @@ typedef struct {
     float psk8_coarse_freq;
     const float *bit_fir;
     psk_rtty_complex_t psk8_eighth_prev;
+    psk_rtty_complex_t psk8_eighth_prev_carrier[12];
+    uint8_t psk8_eighth_valid_carrier[12];
     float bit_phase_inc;
     float bit_phase_pos;
     int second_decim;

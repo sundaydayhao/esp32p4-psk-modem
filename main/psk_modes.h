@@ -5,6 +5,8 @@
 
 #include "psk_rtty.h"
 
+#define PSK_DEFAULT_TONE_HZ 2000
+
 typedef enum {
     PSK_MODE_FAMILY_BPSK = 0,
     PSK_MODE_FAMILY_QPSK,
@@ -39,6 +41,7 @@ typedef enum {
     PSK_MODE_8PSK500F,
     PSK_MODE_8PSK1000F,
     PSK_MODE_8PSK1200F,
+    PSK_MODE_2X8PSK1200F,
     PSK_MODE_COUNT
 } psk_mode_t;
 

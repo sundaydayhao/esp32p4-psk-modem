@@ -77,6 +77,8 @@ static const psk_mode_info_t s_modes[PSK_MODE_COUNT] = {
          PSK_RTTY_MODE_8PSK1000F, 7, 0x6dU, 0x4fU, 512, 0, 1),
     MODE(PSK_MODE_8PSK1200F, "8PSK1200F", PSK_MODE_FAMILY_8PSK, 16000.0f / 13.0f, 3, 1, 2048, 1, 1, 1,
          PSK_RTTY_MODE_8PSK1200F, 7, 0x6dU, 0x4fU, 512, 0, 1),
+    MODE(PSK_MODE_2X8PSK1200F, "2x8PSK1200F", PSK_MODE_FAMILY_8PSK, 16000.0f / 13.0f, 3, 2, 2048, 1, 1, 1,
+         PSK_RTTY_MODE_2X8PSK1200F, 7, 0x6dU, 0x4fU, 512, 0, 1),
 };
 
 const psk_mode_info_t *psk_mode_info(psk_mode_t mode)

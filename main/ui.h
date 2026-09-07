@@ -17,6 +17,7 @@ typedef enum {
     UI_EVENT_INPUT_GAIN,
     UI_EVENT_RX_DIAG,
     UI_EVENT_RX_FEC_BRANCH,
+    UI_EVENT_RX_CONFIG,
     UI_EVENT_TX_STOP
 } ui_event_type_t;
 

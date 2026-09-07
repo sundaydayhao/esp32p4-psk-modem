@@ -1,4 +1,5 @@
 #include <math.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -19,6 +20,7 @@
 #include "psk_tx.h"
 #include "spectrum.h"
 #include "transport.h"
+#include "rx_web.h"
 #include "ui.h"
 
 static const char *TAG = "psk-modem";
@@ -58,7 +60,7 @@ static QueueHandle_t s_control_queue;
 static QueueHandle_t s_spectrum_queue;
 static QueueHandle_t s_tx_queue;
 static modem_t s_audio_modem;
-static int16_t s_audio_samples[128];
+static int16_t s_audio_samples[256];
 static char s_audio_decoded[sizeof(((decoded_msg_t *)0)->text)];
 static volatile int s_display_role;
 static volatile int s_tx_active;
@@ -72,7 +74,7 @@ static volatile int s_waterfall_peak_hz;
 #define WATERFALL_SOURCE_TX 1U
 #define RX_INPUT_OPEN_ABS_AVG 500U
 #define TX_TEXT_DEFAULT \
-    "CQ CQ CQ DE HPM6750 PSK MODEM. THIS IS A CONTINUOUS BOARD TO BOARD AUDIO LINK TEST AT 1500 HZ. COPY THE QUICK BROWN FOX 0123456789.\n"
+    "CQ CQ CQ DE HPM6750 PSK MODEM. THIS IS A CONTINUOUS BOARD TO BOARD AUDIO LINK TEST AT 2000 HZ. COPY THE QUICK BROWN FOX 0123456789.\n"
 
 typedef struct {
     int16_t latest[SPECTRUM_BLOCK_SAMPLES];
@@ -129,6 +131,10 @@ static void publish_decoded_text(const char *decoded, size_t decoded_len)
 static void apply_control_event(modem_t *modem, const ui_event_t *event)
 {
     switch (event->type) {
+    case UI_EVENT_RX_CONFIG:
+        modem_set_psk_mode(modem, event->psk_mode);
+        modem_set_rx_tone(modem, event->tone_hz);
+        break;
     case UI_EVENT_MODE_CHANGED:
         modem_set_mode(modem, event->mode);
         break;
@@ -314,7 +320,7 @@ static void tx_task(void *arg)
     psk_tx_t *tx = &s_tx_modem;
     psk_tx_init(tx, BOARD_CODEC_SAMPLE_RATE_HZ);
     psk_mode_t tx_mode = PSK_MODE_BPSK31;
-    int tx_tone_hz = 1500;
+    int tx_tone_hz = 2000;
     char tx_text[sizeof(((tx_cmd_t *)0)->text)] = TX_TEXT_DEFAULT;
     uint8_t tx_loop_enabled = 0U;
 
@@ -340,7 +346,7 @@ static void tx_task(void *arg)
                 break;
             case TX_CMD_START_TEXT:
                 tx_mode = cmd.mode;
-                tx_tone_hz = cmd.tone_hz > 0 ? cmd.tone_hz : 1500;
+                tx_tone_hz = cmd.tone_hz > 0 ? cmd.tone_hz : 2000;
                 if (cmd.text[0] != '\0') {
                     strncpy(tx_text, cmd.text, sizeof(tx_text) - 1U);
                     tx_text[sizeof(tx_text) - 1U] = '\0';
@@ -401,122 +407,97 @@ static void tx_task(void *arg)
     }
 }
 
+static bool web_configure_receiver(psk_mode_t mode, int tone_hz)
+{
+    const ui_event_t event = {.type = UI_EVENT_RX_CONFIG, .psk_mode = mode, .tone_hz = tone_hz};
+    return s_control_queue && xQueueSend(s_control_queue, &event, 0) == pdTRUE;
+}
+
 static void audio_task(void *arg)
 {
     (void)arg;
-
-    const modem_config_t modem_config = {
-        .mode = MODEM_MODE_BPSK31,
-        .psk_mode = PSK_MODE_BPSK31,
-        .sample_rate_hz = BOARD_MODEM_SAMPLE_RATE_HZ,
-        .rx_tone_hz = 1500,
-        .squelch = 35,
+    const modem_config_t config = {
+        .mode = MODEM_MODE_BPSK31, .psk_mode = PSK_MODE_BPSK31,
+        .sample_rate_hz = BOARD_MODEM_SAMPLE_RATE_HZ, .rx_tone_hz = 2000, .squelch = 35,
     };
     modem_t *modem = &s_audio_modem;
-    modem_init(modem, &modem_config);
-
-    int64_t last_status_log_us = 0;
-    uint32_t reads_this_second = 0;
-    uint32_t samples_this_second = 0;
-    uint64_t dsp_us_sum = 0;
-    uint32_t dsp_us_max = 0;
-    uint32_t dsp_blocks = 0;
-    int32_t last_abs_avg = 0;
-    bool last_active = false;
-    uint8_t rx_input_open = 0U;
-    uint8_t rx_input_closed_blocks = 0U;
-
-    ESP_LOGI(TAG, "audio decode task started");
-
-    while (true) {
+    modem_init(modem, &config);
+    rx_web_status_t status = {0};
+    uint64_t dsp_sum = 0, dsp_samples = 0;
+    uint32_t samples = 0, dsp_max = 0;
+    uint8_t input_open = 0, closed_blocks = 0;
+    int64_t window_start = esp_timer_get_time(), last_yield = window_start;
+    ESP_LOGI(TAG, "audio decode task started: %u samples/block", (unsigned)(sizeof(s_audio_samples)/sizeof(s_audio_samples[0])));
+    for (;;) {
         ui_event_t event;
-        while (xQueueReceive(s_control_queue, &event, 0) == pdTRUE) {
+        /* Bound control work so clients cannot starve I2S by flooding commands. */
+        for (unsigned i = 0; i < 4 && xQueueReceive(s_control_queue, &event, 0) == pdTRUE; ++i) {
             apply_control_event(modem, &event);
+            status.mode = modem_get_psk_mode(modem);
+            status.tone_hz = modem->config.rx_tone_hz;
+            rx_web_set_status(&status);
         }
-
         const size_t count = audio_input_read(s_audio_samples,
-                                              sizeof(s_audio_samples) / sizeof(s_audio_samples[0]),
-                                              50);
-        const int64_t now_us = esp_timer_get_time();
-        if (count > 0) {
-            reads_this_second++;
-            samples_this_second += count;
-            append_waterfall_stream(&s_rx_waterfall, WATERFALL_SOURCE_RX, s_audio_samples,
-                                    count, BOARD_MODEM_SAMPLE_RATE_HZ);
-
-            last_abs_avg = calc_block_abs_avg(s_audio_samples, count);
-            s_input_abs_avg = last_abs_avg;
-            last_active = last_abs_avg >= RX_INPUT_OPEN_ABS_AVG;
-            if (last_active) {
-                if (!rx_input_open) {
+            sizeof(s_audio_samples)/sizeof(s_audio_samples[0]), 50);
+        if (count) {
+            samples += count;
+            append_waterfall_stream(&s_rx_waterfall, WATERFALL_SOURCE_RX,
+                                    s_audio_samples, count, BOARD_MODEM_SAMPLE_RATE_HZ);
+            s_input_abs_avg = calc_block_abs_avg(s_audio_samples, count);
+            if (s_input_abs_avg >= RX_INPUT_OPEN_ABS_AVG) {
+                if (!input_open) {
                     modem_set_psk_mode(modem, modem_get_psk_mode(modem));
-                    rx_input_open = 1U;
+                    input_open = 1;
                 }
-                rx_input_closed_blocks = 0U;
-            } else if (rx_input_closed_blocks < 20U) {
-                rx_input_closed_blocks++;
+                closed_blocks = 0;
+            } else if (closed_blocks < 10) { /* about 53 ms at 256 / 48 kHz */
+                ++closed_blocks;
             } else {
-                rx_input_open = 0U;
+                input_open = 0;
             }
-
-            if (rx_input_open) {
-                const int64_t dsp_start_us = esp_timer_get_time();
-                const size_t decoded_len = modem_process(modem, s_audio_samples, count,
-                                                         s_audio_decoded, sizeof(s_audio_decoded));
-                const uint32_t dsp_us = (uint32_t)(esp_timer_get_time() - dsp_start_us);
-                dsp_us_sum += dsp_us;
-                dsp_blocks++;
-                if (dsp_us > dsp_us_max) {
-                    dsp_us_max = dsp_us;
-                }
-                publish_decoded_text(s_audio_decoded, decoded_len);
+            status.block_budget_us = (uint32_t)((uint64_t)count * 1000000 / BOARD_MODEM_SAMPLE_RATE_HZ);
+            if (input_open) {
+                const int64_t start = esp_timer_get_time();
+                const size_t len = modem_process(modem, s_audio_samples, count,
+                                                 s_audio_decoded, sizeof(s_audio_decoded));
+                const uint32_t elapsed = (uint32_t)(esp_timer_get_time() - start);
+                dsp_sum += elapsed;
+                dsp_samples += count;
+                if (elapsed > dsp_max) dsp_max = elapsed;
+                if (elapsed > status.block_budget_us) ++status.deadline_misses;
+                publish_decoded_text(s_audio_decoded, len);
             }
+        } else {
+            ++status.read_errors;
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
-
+        const int64_t now = esp_timer_get_time();
+        const uint64_t window = (uint64_t)(now - window_start);
+        if (window >= 1000000) {
+            psk_rx_debug_t debug;
+            psk_rx_debug_snapshot(&modem->decoder.psk_rx, &debug);
+            status.mode = modem_get_psk_mode(modem);
+            status.tone_hz = modem->config.rx_tone_hz;
+            status.lock_state = input_open ? debug.lock_state : 0;
+            status.input_level = (unsigned)s_input_abs_avg;
+            status.samples_per_second = (unsigned)((uint64_t)samples * 1000000 / window);
+            status.dsp_load_permille = dsp_samples ? (unsigned)(dsp_sum * BOARD_MODEM_SAMPLE_RATE_HZ / (dsp_samples * 1000)) : 0;
+            status.dsp_max_us = dsp_max;
+            rx_web_set_status(&status);
 #if BOARD_MODEM_DEBUG_LOGS
-        if (now_us - last_status_log_us >= 5000000) {
-            last_status_log_us = now_us;
-            psk_rx_debug_t rx_debug;
-            psk_rx_debug_snapshot(&modem->decoder.psk_rx, &rx_debug);
-            const int last_peak_hz = s_waterfall_peak_hz;
-            const uint32_t dsp_avg_us = dsp_blocks ? (uint32_t)(dsp_us_sum / dsp_blocks) : 0U;
-            const uint32_t dsp_block_us = count ?
-                (uint32_t)(((uint64_t)count * 1000000ULL) / BOARD_MODEM_SAMPLE_RATE_HZ) : 0U;
-            const uint32_t dsp_load_permille = dsp_block_us ? (dsp_avg_us * 1000U) / dsp_block_us : 0U;
-            ESP_LOGI(TAG,
-                     "mode=%s psk=%s rx=%d Hz off=%d mHz peak=%d Hz abs=%d active=%d reads=%u samples=%u lock=%u sq=%d lvl=%d/%d stable=%d warm=%d dsp=%u/%uus load=%u.%u%% sym=%u bits=%u z=%u o=%u dd=%u ch=%u unk=%u fec=%d/%d sel=%u soft=%u coarse=%u pk=%d/%d bins=%d",
-                     modem_mode_name(modem_get_mode(modem)), modem_psk_mode_name(modem_get_psk_mode(modem)),
-                     rx_debug.tone_hz, rx_debug.carrier_offset_millihz,
-                     last_peak_hz, (int)last_abs_avg, last_active,
-                     (unsigned)reads_this_second, (unsigned)samples_this_second,
-                     rx_debug.lock_state, rx_debug.sq_open, rx_debug.sq_level, rx_debug.sq_thresh,
-                     rx_debug.stable_symbols, rx_debug.warmup_symbols,
-                     (unsigned)dsp_avg_us, (unsigned)dsp_us_max,
-                     (unsigned)(dsp_load_permille / 10U), (unsigned)(dsp_load_permille % 10U),
-                     (unsigned)rx_debug.symbols, (unsigned)rx_debug.bits,
-                     (unsigned)rx_debug.zeros, (unsigned)rx_debug.ones,
-                     (unsigned)rx_debug.delims, (unsigned)rx_debug.chars, (unsigned)rx_debug.unknown,
-                     rx_debug.fec_metric[0], rx_debug.fec_metric[1],
-                     (unsigned)rx_debug.fec_selected,
-                     (unsigned)rx_debug.soft_ambiguous,
-                     (unsigned)rx_debug.coarse_updates,
-                     rx_debug.timing_peak, rx_debug.timing_target, rx_debug.timing_bins);
-            reads_this_second = 0;
-            samples_this_second = 0;
-            dsp_us_sum = 0;
-            dsp_us_max = 0;
-            dsp_blocks = 0;
-        }
-#else
-        (void)now_us;
-        if (last_status_log_us == 0) {
-            last_status_log_us = 1;
-        }
-        reads_this_second = 0;
-        samples_this_second = 0;
+            ESP_LOGI(TAG, "RX %s load=%u.%u%% max=%uus budget=%uus late=%" PRIu32 " samples/s=%u",
+                     psk_mode_name(status.mode), status.dsp_load_permille/10,
+                     status.dsp_load_permille%10, dsp_max, status.block_budget_us,
+                     status.deadline_misses, status.samples_per_second);
 #endif
-
-        vTaskDelay(pdMS_TO_TICKS(1));
+            samples = 0; dsp_sum = 0; dsp_samples = 0; dsp_max = 0;
+            window_start = now;
+        }
+        /* I2S normally blocks. Still let core 0 idle run under sustained overload. */
+        if (now - last_yield >= 20000) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+            last_yield = esp_timer_get_time();
+        }
     }
 }
 
@@ -533,8 +514,8 @@ static void ui_task(void *arg)
     display_state.selected_psk_mode = PSK_MODE_BPSK31;
     display_state.selected_tx_psk_mode = PSK_MODE_BPSK31;
     display_state.transport_mode = TRANSPORT_MODE_USB_SERIAL;
-    display_state.rx_tone_hz = 1500;
-    display_state.tx_tone_hz = 1500;
+    display_state.rx_tone_hz = 2000;
+    display_state.tx_tone_hz = 2000;
     strncpy(display_state.tx_text, TX_TEXT_DEFAULT, sizeof(display_state.tx_text) - 1U);
     display_state.tx_text[sizeof(display_state.tx_text) - 1U] = '\0';
 
@@ -542,6 +523,8 @@ static void ui_task(void *arg)
     uint32_t last_waterfall_source_key = 0xffffffffUL;
     uint32_t last_waterfall_sample_rate_hz = 0U;
     int64_t last_render_us = 0;
+    psk_mode_t last_rx_mode = PSK_MODE_BPSK31;
+    int last_rx_tone = 2000;
 
     clear_display_spectrum(&spectrum);
     ESP_LOGI(TAG, "ui task started");
@@ -552,6 +535,15 @@ static void ui_task(void *arg)
             display_append_text(&display_state, msg.text);
         }
 
+        rx_web_status_t actual;
+        rx_web_get_status(&actual);
+        if (actual.mode != last_rx_mode || actual.tone_hz != last_rx_tone) {
+            last_rx_mode = actual.mode; last_rx_tone = actual.tone_hz;
+            display_state.selected_psk_mode = actual.mode;
+            display_state.selected_mode = actual.mode == PSK_MODE_BPSK31 ? MODEM_MODE_BPSK31 : MODEM_MODE_PSK63;
+            display_state.rx_tone_hz = actual.tone_hz;
+        }
+        display_state.transport_mode = transport_get_mode();
         const ui_event_t event = ui_poll(&display_state);
         switch (event.type) {
         case UI_EVENT_MODE_CHANGED:
@@ -639,7 +631,7 @@ static void ui_task(void *arg)
             display_state.display_role = 1;
             s_display_role = 1;
             display_state.selected_tx_psk_mode = event.tx_psk_mode;
-            display_state.tx_tone_hz = event.tx_tone_hz > 0 ? event.tx_tone_hz : 1500;
+            display_state.tx_tone_hz = event.tx_tone_hz > 0 ? event.tx_tone_hz : 2000;
             strncpy(display_state.tx_text, event.tx_text, sizeof(display_state.tx_text) - 1);
             display_state.tx_text[sizeof(display_state.tx_text) - 1] = '\0';
             tx_cmd_t cmd = {
@@ -732,7 +724,7 @@ void app_main(void)
     ESP_ERROR_CHECK(audio_input_set_gain_db(BOARD_AUDIO_INPUT_GAIN_DB));
 
     s_decoded_queue = xQueueCreate(8, sizeof(decoded_msg_t));
-    s_control_queue = xQueueCreate(4, sizeof(ui_event_t));
+    s_control_queue = xQueueCreate(12, sizeof(ui_event_t));
     s_spectrum_queue = xQueueCreate(1, sizeof(spectrum_msg_t));
     s_tx_queue = xQueueCreate(4, sizeof(tx_cmd_t));
     ESP_ERROR_CHECK(s_decoded_queue && s_control_queue && s_spectrum_queue && s_tx_queue ?
@@ -745,6 +737,7 @@ void app_main(void)
     task_ok = xTaskCreatePinnedToCore(ui_task, "psk_ui", 8192, NULL, 2, NULL, 1);
     ESP_ERROR_CHECK(task_ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 
+    ESP_ERROR_CHECK(rx_web_start(web_configure_receiver));
     ESP_LOGI(TAG, "ESP32-P4 PSK modem started");
 
     while (true) {

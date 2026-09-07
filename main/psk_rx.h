@@ -6,35 +6,6 @@
 #include "psk_modes.h"
 #include "psk_rtty.h"
 
-#define PSK1200F_FRAME_HEADER_CAPACITY 64U
-#define PSK1200F_FRAME_BASE64_CAPACITY 4096U
-#define PSK1200F_FRAME_PAYLOAD_CAPACITY 3072U
-
-typedef enum {
-    PSK1200F_FRAME_SEARCH = 0,
-    PSK1200F_FRAME_HEADER,
-    PSK1200F_FRAME_DATA,
-    PSK1200F_FRAME_RESYNC,
-} psk1200f_frame_state_t;
-
-typedef struct {
-    psk1200f_frame_state_t state;
-    char header[PSK1200F_FRAME_HEADER_CAPACITY];
-    char base64[PSK1200F_FRAME_BASE64_CAPACITY];
-    uint16_t header_len;
-    uint16_t base64_len;
-    uint16_t delivery_len;
-    uint16_t delivery_pos;
-    uint16_t expected_len;
-    uint32_t expected_crc;
-    uint32_t sequence;
-    uint32_t next_sequence;
-    uint32_t valid_frames;
-    uint32_t invalid_frames;
-    uint32_t sync_events;
-    uint8_t sequence_started;
-} psk1200f_frame_t;
-
 typedef struct {
     psk_mode_t mode;
     int sample_rate_hz;
@@ -52,7 +23,6 @@ typedef struct {
     size_t out_len;
     uint8_t backend_active;
     int fec_branch_override;
-    psk1200f_frame_t frame1200f;
 } psk_rx_t;
 
 typedef struct {
