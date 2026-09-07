@@ -100,6 +100,7 @@ typedef struct {
     psk_rtty_complex_t chan_bit_queue[12][65];
     psk_rtty_complex_t chan_freq_signal[12];
     psk_rtty_complex_t chan_bit_signal[12];
+    psk_rtty_complex_t chan_prev_bit_signal[12];
     int chan_dec1_state[12];
     int chan_dec2_state[12];
     int chan_bit_fir_state[12];
@@ -126,6 +127,8 @@ typedef struct {
     uint8_t fec_enabled;
     uint8_t fec_punctured;
     uint8_t use_mfsk_varicode;
+    uint8_t binary_mode, binary_bit_count, binary_synced, binary_sync_bit_count;
+    uint32_t binary_sync_word, binary_sync_shift;
     uint32_t fec_pair_count;
     uint8_t fec_dual_branch;
     uint8_t fec_locked_branch;
@@ -195,6 +198,7 @@ typedef struct {
     uint32_t debug_timing_adjusts;
     uint32_t debug_soft_ambiguous;
     uint32_t debug_coarse_updates;
+    uint32_t debug_fec_reacquires;
     int debug_fec_metric[2];
     uint32_t debug_fec_pairs[2];
     uint32_t debug_fec_pair_count;

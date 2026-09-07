@@ -3,6 +3,12 @@
 
 #include <math.h>
 #include <string.h>
+#ifdef ESP_PLATFORM
+#include "esp_attr.h"
+#define TX_SCRATCH_RAM EXT_RAM_BSS_ATTR
+#else
+#define TX_SCRATCH_RAM
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -15,8 +21,8 @@ enum {
     PSK_TX_STAGE_POSTAMBLE,
 };
 
-static uint8_t s_tx_raw_bits[PSK_TX_BIT_MAX];
-static uint8_t s_tx_punctured_bits[PSK_TX_BIT_MAX];
+static uint8_t s_tx_raw_bits[PSK_TX_BIT_MAX] TX_SCRATCH_RAM;
+static uint8_t s_tx_punctured_bits[PSK_TX_BIT_MAX] TX_SCRATCH_RAM;
 static uint8_t s_tx_interleave_table[2560];
 
 #define PSK_TX_DEFAULT_AMPLITUDE 26000

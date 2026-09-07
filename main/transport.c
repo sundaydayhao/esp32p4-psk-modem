@@ -11,6 +11,7 @@ static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static rx_history_t s_history;
 static transport_mode_t s_mode = TRANSPORT_MODE_USB_SERIAL;
 static uint64_t s_usb_dropped;
+static uint32_t s_epoch;
 
 const char *transport_mode_name(transport_mode_t mode)
 {
@@ -29,7 +30,7 @@ static void usb_task(void *arg)
     uint8_t bytes[256];
     for (;;) {
         uint64_t lost;
-        const size_t n = transport_read(&cursor, bytes, sizeof(bytes), &lost);
+        const size_t n = transport_read(&cursor, bytes, sizeof(bytes), &lost, NULL);
         const bool enabled = transport_get_mode() == TRANSPORT_MODE_USB_SERIAL;
         int written = 0;
         if (n && enabled) written = usb_serial_jtag_write_bytes(bytes, n, pdMS_TO_TICKS(20));
@@ -76,10 +77,18 @@ void transport_send(const uint8_t *data, size_t len)
     portEXIT_CRITICAL(&s_lock);
 }
 
-size_t transport_read(uint64_t *cursor, uint8_t *out, size_t capacity, uint64_t *lost)
+void transport_begin_session(uint32_t epoch)
+{
+    portENTER_CRITICAL(&s_lock);
+    s_epoch = epoch; s_history.session_start = s_history.total;
+    portEXIT_CRITICAL(&s_lock);
+}
+
+size_t transport_read(uint64_t *cursor, uint8_t *out, size_t capacity, uint64_t *lost, uint32_t *epoch)
 {
     portENTER_CRITICAL(&s_lock);
     const size_t n = rx_history_read(&s_history, cursor, out, capacity, lost);
+    if (epoch) *epoch = s_epoch;
     portEXIT_CRITICAL(&s_lock);
     return n;
 }

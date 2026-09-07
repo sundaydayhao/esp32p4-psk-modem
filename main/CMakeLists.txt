@@ -16,7 +16,12 @@ idf_component_register(
         "rx_history.c"
         "rx_web.c"
         "ui.c"
+        "modem_image.c"
+        "voice_protocol.c"
+        "content_service.c"
+        "ap580_playout.c"
+        "uart_tx_pump.c"
     INCLUDE_DIRS "."
-    REQUIRES esp_timer esp_driver_gpio esp_driver_i2s esp_driver_usb_serial_jtag esp32_p4_function_ev_board esp_codec_dev lvgl psk_rtty ft8lib esp_wifi esp_netif esp_event esp_http_server nvs_flash json
+    REQUIRES esp_timer esp_driver_gpio esp_driver_uart esp_driver_i2s esp_driver_usb_serial_jtag esp32_p4_function_ev_board esp_codec_dev lvgl psk_rtty ft8lib esp_wifi esp_netif esp_event esp_http_server nvs_flash json
     EMBED_TXTFILES "rx.html"
 )

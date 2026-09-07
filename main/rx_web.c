@@ -69,14 +69,17 @@ static esp_err_t receive_handler(httpd_req_t *req)
         if (errno == ERANGE) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Cursor overflow");
     }
     uint8_t bytes[1024];
-    const size_t n = transport_read(&cursor, bytes, sizeof(bytes), &lost);
-    char next[24], skipped[24];
+    uint32_t epoch;
+    const size_t n = transport_read(&cursor, bytes, sizeof(bytes), &lost, &epoch);
+    char next[24], skipped[24], generation[16];
     snprintf(next, sizeof(next), "%" PRIu64, cursor);
     snprintf(skipped, sizeof(skipped), "%" PRIu64, lost);
+    snprintf(generation, sizeof(generation), "%" PRIu32, epoch);
     no_cache(req);
     httpd_resp_set_type(req, "application/octet-stream");
     httpd_resp_set_hdr(req, "X-Next-Cursor", next);
     httpd_resp_set_hdr(req, "X-Lost-Bytes", skipped);
+    httpd_resp_set_hdr(req, "X-Content-Epoch", generation);
     return httpd_resp_send(req, (const char *)bytes, n);
 }
 
@@ -97,10 +100,34 @@ static esp_err_t status_handler(httpd_req_t *req)
 {
     rx_web_status_t s;
     rx_web_get_status(&s);
+    content_status_t cs;
+    content_get_status(&cs);
+    if (cs.epoch != s.content_epoch) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(req, "Content changing; retry");
+    }
     const psk_mode_info_t *mode = psk_mode_info(s.mode);
     cJSON *json = cJSON_CreateObject();
     if (!json) return send_json(req, NULL);
     cJSON_AddStringToObject(json, "boot_id", s_boot_id);
+    cJSON_AddNumberToObject(json, "content_type", s.content_type);
+    cJSON_AddNumberToObject(json, "content_epoch", s.content_epoch);
+    cJSON_AddStringToObject(json, "role", s.display_role ? "TX" : "RX");
+    cJSON_AddNumberToObject(json, "image_rows", cs.image_rows);
+    cJSON_AddNumberToObject(json, "image_version", cs.image_version);
+    cJSON_AddNumberToObject(json, "image_bad_rows", cs.image_bad_rows);
+    cJSON_AddNumberToObject(json, "voice_rate", cs.voice_rate);
+    cJSON_AddNumberToObject(json, "voice_packets", cs.voice_packets);
+    cJSON_AddNumberToObject(json, "voice_frames", cs.voice_frames);
+    cJSON_AddNumberToObject(json, "voice_crc_errors", cs.voice_crc_errors);
+    cJSON_AddNumberToObject(json, "uart_rx_frames", cs.uart_rx_frames);
+    cJSON_AddNumberToObject(json, "uart_tx_frames", cs.uart_tx_frames);
+    cJSON_AddNumberToObject(json, "uart_timeouts", cs.uart_timeouts);
+    cJSON_AddNumberToObject(json, "queue_drops", cs.queue_drops);
+    cJSON_AddBoolToObject(json, "uart_ready", cs.uart_ready);
+    char frame[49];
+    for (unsigned i = 0; i < 16; ++i) snprintf(frame + i * 3, 4, "%02X ", cs.last_voice_frame[i]);
+    cJSON_AddStringToObject(json, "last_voice_frame", frame);
     cJSON_AddStringToObject(json, "mode", mode->name);
     cJSON_AddNumberToObject(json, "mode_id", s.mode);
     cJSON_AddNumberToObject(json, "tone_hz", s.tone_hz);
@@ -132,6 +159,7 @@ static esp_err_t modes_handler(httpd_req_t *req)
         if (!item) { cJSON_Delete(json); return send_json(req, NULL); }
         cJSON_AddNumberToObject(item, "id", i);
         cJSON_AddStringToObject(item, "name", psk_mode_info_at(i)->name);
+        cJSON_AddBoolToObject(item, "image_allowed", modem_image_mode_allowed((psk_mode_t)i));
         cJSON_AddItemToArray(json, item);
     }
     return send_json(req, json);
@@ -154,16 +182,23 @@ static esp_err_t config_handler(httpd_req_t *req)
     cJSON *json = cJSON_ParseWithLengthOpts(body, used + 1, NULL, true);
     const cJSON *mode = cJSON_GetObjectItemCaseSensitive(json, "mode");
     const cJSON *tone = cJSON_GetObjectItemCaseSensitive(json, "tone_hz");
-    const bool valid = cJSON_IsNumber(mode) && cJSON_IsNumber(tone) &&
+    const cJSON *content = cJSON_GetObjectItemCaseSensitive(json, "content_type");
+    rx_web_status_t current;
+    rx_web_get_status(&current);
+    const int selected = content && cJSON_IsNumber(content) ? content->valueint : current.content_type;
+    const bool valid = (!content || (cJSON_IsNumber(content) && content->valuedouble == selected)) &&
+        selected >= 0 && selected < CONTENT_COUNT && cJSON_IsNumber(mode) && cJSON_IsNumber(tone) &&
         isfinite(mode->valuedouble) && isfinite(tone->valuedouble) &&
         mode->valuedouble >= 0 && mode->valuedouble < PSK_MODE_COUNT &&
         mode->valuedouble == mode->valueint && tone->valuedouble == tone->valueint &&
-        tone->valueint >= 100 && tone->valueint <= 3500;
+        tone->valueint >= 100 && tone->valueint <= 3500 &&
+        (selected != CONTENT_IMAGE || modem_image_mode_allowed((psk_mode_t)mode->valueint)) &&
+        (selected != CONTENT_AUDIO || (mode->valueint == PSK_MODE_2X8PSK1200F && tone->valueint == 2000));
     if (!valid) {
         cJSON_Delete(json);
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid mode or tone (100-3500 Hz)");
     }
-    const bool queued = s_config_cb && s_config_cb((psk_mode_t)mode->valueint, tone->valueint);
+    const bool queued = s_config_cb && s_config_cb((psk_mode_t)mode->valueint, tone->valueint, selected);
     cJSON_Delete(json);
     if (!queued) {
         httpd_resp_set_status(req, "503 Service Unavailable");
@@ -173,6 +208,41 @@ static esp_err_t config_handler(httpd_req_t *req)
     no_cache(req);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, "{\"queued\":true}");
+}
+
+static void put_le32(uint8_t *out, uint32_t value)
+{
+    for (unsigned i = 0; i < 4; ++i) out[i] = (uint8_t)(value >> (i * 8));
+}
+
+static esp_err_t image_handler(httpd_req_t *req)
+{
+    enum { BMP_BYTES = 54 + 96 * 96 * 3 };
+    uint8_t *storage = heap_caps_malloc(BMP_BYTES + MODEM_IMAGE_PIXEL_COUNT, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!storage) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No image memory");
+    uint8_t *pixels = storage + BMP_BYTES;
+    content_status_t cs;
+    content_copy_image(pixels, &cs);
+    memset(storage, 0, 54);
+    storage[0] = 'B'; storage[1] = 'M';
+    put_le32(storage + 2, BMP_BYTES); put_le32(storage + 10, 54); put_le32(storage + 14, 40);
+    put_le32(storage + 18, 96); put_le32(storage + 22, 96);
+    storage[26] = 1; storage[28] = 24; put_le32(storage + 34, BMP_BYTES - 54);
+    for (unsigned y = 0; y < 96; ++y) for (unsigned x = 0; x < 96; ++x) {
+        const uint8_t p = pixels[(95 - y) * 96 + x];
+        uint8_t *rgb = storage + 54 + (y * 96 + x) * 3;
+        rgb[0] = (p & 3) * 255 / 3; rgb[1] = ((p >> 2) & 7) * 255 / 7; rgb[2] = (p >> 5) * 255 / 7;
+    }
+    char epoch[16], version[16];
+    snprintf(epoch, sizeof(epoch), "%" PRIu32, cs.epoch);
+    snprintf(version, sizeof(version), "%" PRIu32, cs.image_version);
+    no_cache(req);
+    httpd_resp_set_hdr(req, "X-Content-Epoch", epoch);
+    httpd_resp_set_hdr(req, "X-Image-Version", version);
+    httpd_resp_set_type(req, "image/bmp");
+    const esp_err_t result = httpd_resp_send(req, (const char *)storage, BMP_BYTES);
+    free(storage);
+    return result;
 }
 
 static esp_err_t start_ap(void)
@@ -225,6 +295,7 @@ static void web_task(void *arg)
         {.uri = "/api/status", .method = HTTP_GET, .handler = status_handler},
         {.uri = "/api/modes", .method = HTTP_GET, .handler = modes_handler},
         {.uri = "/api/config", .method = HTTP_POST, .handler = config_handler},
+        {.uri = "/api/image", .method = HTTP_GET, .handler = image_handler},
     };
     for (size_t i = 0; err == ESP_OK && i < sizeof(routes)/sizeof(routes[0]); ++i)
         err = httpd_register_uri_handler(server, &routes[i]);

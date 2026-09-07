@@ -23,6 +23,8 @@ typedef struct {
     size_t out_len;
     uint8_t backend_active;
     int fec_branch_override;
+    uint8_t binary_mode;
+    uint32_t binary_sync_word;
 } psk_rx_t;
 
 typedef struct {
@@ -52,6 +54,7 @@ typedef struct {
     uint32_t timing_adjusts;
     uint32_t soft_ambiguous;
     uint32_t coarse_updates;
+    uint32_t fec_reacquires;
     uint32_t valid_frames;
     uint32_t invalid_frames;
     uint32_t frame_sync_events;
@@ -79,3 +82,6 @@ int psk_rx_mode_supported(psk_mode_t mode);
 void psk_rx_debug_snapshot(const psk_rx_t *m, psk_rx_debug_t *debug);
 size_t psk_rx_process(psk_rx_t *m, const int16_t *samples, size_t count,
                          char *out, size_t out_size);
+
+void psk_rx_set_binary_sync(psk_rx_t *m, uint32_t sync_word);
+void psk_rx_reacquire_binary(psk_rx_t *m);

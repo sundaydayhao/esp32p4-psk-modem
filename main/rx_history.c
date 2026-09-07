@@ -20,7 +20,8 @@ void rx_history_append(rx_history_t *h, const uint8_t *data, size_t len)
 size_t rx_history_read(const rx_history_t *h, uint64_t *cursor,
                        uint8_t *out, size_t capacity, uint64_t *lost)
 {
-    const uint64_t oldest = h->total > RX_HISTORY_CAPACITY ? h->total - RX_HISTORY_CAPACITY : 0;
+    uint64_t oldest = h->total > RX_HISTORY_CAPACITY ? h->total - RX_HISTORY_CAPACITY : 0;
+    if (oldest < h->session_start) oldest = h->session_start;
     *lost = 0;
     if (*cursor > h->total) *cursor = oldest;
     if (*cursor < oldest) {

@@ -1,65 +1,51 @@
-"""Local browser QA fixture only. This does not emulate ESP-IDF or radio hardware."""
+"""Local UI fixture only. Exercises the production HTML without a board or Wi-Fi."""
 import json
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import re
+import struct
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit, parse_qs
 
 ROOT = Path(__file__).resolve().parents[1]
-MODES = ['BPSK31', '8PSK1000', '8PSK1200F', '2x8PSK1200F']
-STATE = dict(boot_id='preview-only', mode='BPSK31', mode_id=0, tone_hz=2000,
-             baud=31.25, carriers=1, information_bps=31.25, lock_state=3,
-             input_level=1200, samples_per_second=48000, dsp_load_percent=24.6,
-             dsp_max_us=1800, block_budget_us=5333, deadline_misses=0,
-             read_errors=0, received_bytes=0, usb_dropped_bytes=0,
-             internal_heap_min=120000, uptime_ms=10000)
-DATA = b'LOCAL PREVIEW / simulated receive data\nCQ CQ DE HPM6750\nThe quick brown fox 0123456789.\n<script>alert("render as text")</script>\n\x00\xff'
-STATE['received_bytes'] = len(DATA)
-
+mode_names = re.findall(r'MODE\([^,]+, "([^"]+)"', (ROOT/'main/psk_modes.c').read_text())
+allowed = {9, 10, 11, 12, 20, 21, 25, 26, 27}
+state = dict(boot_id='preview-only', content_epoch=1, content_type=0, mode_id=0, tone_hz=2000,
+    role='RX', lock_state=3, dsp_load_percent=12.5, received_bytes=0, baud=1230.769,
+    carriers=2, information_bps=4923.077, samples_per_second=48000, dsp_max_us=900,
+    block_budget_us=5333, deadline_misses=0, read_errors=0, image_rows=63, image_version=1,
+    image_bad_rows=0, voice_rate=600, voice_packets=24, voice_frames=144, voice_crc_errors=0,
+    uart_rx_frames=0, uart_tx_frames=0, uart_timeouts=0, queue_drops=0, uart_ready=False,
+    last_voice_frame='59 4F 01 07 DD AA 96 E7 00 FF 12 00 00 00 00 24')
+pixels = bytes(int(x,16) for x in re.findall(r'0x([0-9a-fA-F]{2})', (ROOT/'main/modem_image_pixels.inc').read_text()))
+assert len(pixels) == 9216
+bmp = bytearray(54 + 96*96*3)
+struct.pack_into('<2sIHHIIIIHH', bmp, 0, b'BM', len(bmp), 0, 0, 54, 40, 96, 96, 1, 24)
+for y in range(96):
+    for x in range(96):
+        p = pixels[(95-y)*96+x] if 95-y < 63 else 0
+        bmp[54+(y*96+x)*3:54+(y*96+x)*3+3] = bytes(((p&3)*85, ((p>>2)&7)*255//7, (p>>5)*255//7))
 
 class Handler(BaseHTTPRequestHandler):
-    def reply(self, body, kind='application/json', code=200, headers=None):
+    def log_message(self, *_): pass
+    def respond(self, data, mime='application/json', code=200):
+        if not isinstance(data, (bytes,bytearray)): data = json.dumps(data).encode()
         self.send_response(code)
-        self.send_header('Content-Type', kind)
-        self.send_header('Content-Length', str(len(body)))
-        self.send_header('Cache-Control', 'no-store')
-        self.send_header('X-Boot-Id', STATE['boot_id'])
-        for k, v in (headers or {}).items():
-            self.send_header(k, str(v))
-        self.end_headers()
-        self.wfile.write(body)
-
+        for k,v in {'Content-Type':mime, 'Content-Length':str(len(data)), 'Cache-Control':'no-store',
+            'X-Boot-Id':state['boot_id'], 'X-Content-Epoch':str(state['content_epoch']),
+            'X-Image-Version':str(state['image_version']), 'X-Next-Cursor':'0', 'X-Lost-Bytes':'0'}.items():
+            self.send_header(k,v)
+        self.end_headers(); self.wfile.write(data)
     def do_GET(self):
-        url = urlsplit(self.path)
-        if url.path == '/':
-            self.reply((ROOT / 'main/rx.html').read_bytes(), 'text/html; charset=utf-8')
-        elif url.path == '/api/status':
-            self.reply(json.dumps(STATE).encode())
-        elif url.path == '/api/modes':
-            self.reply(json.dumps([dict(id=i, name=n) for i, n in enumerate(MODES)]).encode())
-        elif url.path == '/api/rx':
-            cursor = int(parse_qs(url.query).get('cursor', ['0'])[0])
-            if cursor > len(DATA):
-                cursor = 0
-            chunk = DATA[cursor:cursor + 1024]
-            self.reply(chunk, 'application/octet-stream', headers={
-                'X-Next-Cursor': cursor + len(chunk), 'X-Lost-Bytes': 0})
-        else:
-            self.reply(b'Not found', 'text/plain', 404)
-
+        if self.path == '/': self.respond((ROOT/'main/rx.html').read_bytes(), 'text/html; charset=utf-8')
+        elif self.path == '/api/status': self.respond(dict(state,mode=mode_names[state['mode_id']]))
+        elif self.path == '/api/modes': self.respond([dict(id=i,name=n,image_allowed=i in allowed) for i,n in enumerate(mode_names)])
+        elif self.path.startswith('/api/rx?'): self.respond(b'', 'application/octet-stream')
+        elif self.path == '/api/image': self.respond(bmp, 'image/bmp')
+        else: self.respond({},code=404)
     def do_POST(self):
-        if self.path != '/api/config':
-            return self.reply(b'Not found', 'text/plain', 404)
-        config = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-        mode, tone = config['mode'], config['tone_hz']
-        if not 0 <= mode < len(MODES) or not 100 <= tone <= 3500:
-            return self.reply(b'Invalid', 'text/plain', 400)
-        STATE.update(mode_id=mode, mode=MODES[mode], tone_hz=tone)
-        self.reply(b'{"queued":true}', code=202)
+        value = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        state.update(content_type=value['content_type'], mode_id=value['mode'],tone_hz=value['tone_hz'])
+        state['content_epoch'] += 1
+        self.respond({'queued':True},code=202)
 
-    def log_message(self, *args):
-        pass
-
-
-if __name__ == '__main__':
-    print('Preview fixture: http://127.0.0.1:8874 (no hardware)', flush=True)
-    ThreadingHTTPServer(('127.0.0.1', 8874), Handler).serve_forever()
+print('Local UI fixture at http://127.0.0.1:8765 (sample data only)',flush=True)
+HTTPServer(('127.0.0.1',8765),Handler).serve_forever()

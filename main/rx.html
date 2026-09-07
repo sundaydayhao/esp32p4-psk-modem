@@ -8,34 +8,41 @@
 </style>
 <header><div><div class="sub">ESP32-P4 · AUDIO MODEM</div><h1>PSK 接收台</h1><div class="sub">连接板子热点，即可在这里阅读收到的内容。</div></div><div id="connection" role="status">正在连接…</div></header>
 <section class="panel metrics"><div class="metric"><span>当前接收模式</span><strong id="current">—</strong></div><div class="metric"><span>中心频率</span><strong id="frequency">—</strong></div><div class="metric"><span>解调负载</span><strong id="load">—</strong></div></section>
-<section class="panel"><form id="config"><label>接收模式<select id="mode" required></select></label><label>中心频率 / Hz<input id="tone" type="number" min="100" max="3500" step="1" value="2000" required></label><button id="apply" disabled>应用到接收机</button></form><div id="notice" role="status"></div><div id="diag">等待接收机状态</div></section>
-<section class="panel"><div class="actions"><h2>接收内容 <span id="count" class="sub"></span></h2><div><button id="pause" class="secondary">暂停显示</button> <button id="clear" class="secondary">清空本页</button> <button id="save" class="secondary">保存文本</button></div></div><pre id="text" aria-label="接收文本"></pre></section>
+<section class="panel"><form id="config"><label>内容<select id="kind"><option value="0">Text · 文本</option><option value="1">Image · 图片</option><option value="2">Audio · 语音</option></select></label><label>接收模式<select id="mode" required></select></label><label>中心频率 / Hz<input id="tone" type="number" min="100" max="3500" step="1" value="2000" required></label><button id="apply" disabled>应用到接收机</button></form><div id="notice" role="status"></div><div id="diag">等待接收机状态</div></section>
+<section class="panel"><div class="actions"><h2>接收内容 <span id="count" class="sub"></span></h2><div><button id="pause" class="secondary">暂停显示</button> <button id="clear" class="secondary">清空本页</button> <button id="save" class="secondary">保存文本</button></div></div><div id="picture" hidden><p id="imageProgress"></p><img id="image" alt="收到的 96×96 图片" style="width:min(100%,384px);image-rendering:pixelated;display:block;margin:16px auto"></div><div id="voice" hidden><p id="voiceStatus"></p><p class="sub">语音由外接 AP580 模块播放。浏览器可查看接收状态并保存编码帧；保存文件不是 WAV 音频。</p><pre id="voiceFrame" style="min-height:0"></pre></div><pre id="text" aria-label="接收文本"></pre></section>
 <p class="sub">手机提示“此 Wi-Fi 无法访问互联网”时，请选择继续连接。页面不需要外网。板子保存最近 16 KiB 接收数据，本页最多保留 64 KiB 字符。速率为理论信息位速率，实际文本吞吐还需扣除字符编码及前导开销。</p>
 <script>
 'use strict';
 const $=id=>document.getElementById(id);
-let cursor='0',boot='',paused=false,content='',pending=false,editing=false,modesReady=false;
+let cursor='0',boot='',paused=false,content='',pending=false,editing=false,modesReady=false,modes=[],epoch=null,kind=0,imageVersion=-1,imageUrl='',voiceBytes=new Uint8Array();
 function append(text){content=(content+text).slice(-65536);$('text').textContent=content;$('text').scrollTop=$('text').scrollHeight;}
 async function request(url,options={}){const ctrl=new AbortController();const timer=setTimeout(()=>ctrl.abort(),5000);try{const r=await fetch(url,{...options,cache:'no-store',signal:ctrl.signal});if(!r.ok)throw new Error('HTTP '+r.status);const body=await r.arrayBuffer();return new Response(body,{status:r.status,headers:r.headers});}finally{clearTimeout(timer);}}
-function setBoot(id){if(boot&&boot!==id){cursor='0';append('\n[接收机已重启]\n');}boot=id;}
+function setBoot(id){if(boot&&boot!==id){cursor='0';append('\n[接收机已重启]\n');}if(boot!==id)epoch=null;boot=id;}
 async function poll(){let delay=300;try{
-  if(!modesReady){const modes=await(await request('/api/modes')).json();for(const m of modes){const o=document.createElement('option');o.value=m.id;o.textContent=m.name;$('mode').append(o);}modesReady=true;$('apply').disabled=false;}
+  if(!modesReady){modes=await(await request('/api/modes')).json();fillModes(0);modesReady=true;$('apply').disabled=false;}
   const s=await(await request('/api/status')).json();setBoot(s.boot_id);
+  if(epoch!==s.content_epoch){epoch=s.content_epoch;kind=s.content_type;cursor='0';content='';$('text').textContent='';voiceBytes=new Uint8Array();imageVersion=-1;if(imageUrl)URL.revokeObjectURL(imageUrl);imageUrl='';$('image').removeAttribute('src');}
+  $('picture').hidden=kind!==1;$('voice').hidden=kind!==2;$('text').hidden=kind!==0;$('save').textContent=kind===1?'保存图片':kind===2?'保存 AP580 帧':'保存文本';
+  $('imageProgress').textContent=(s.role==='TX'?'发送测试图':'已接收')+' '+s.image_rows+'/96 行 · '+Math.floor(s.image_rows*100/96)+'% · CRC 错行 '+s.image_bad_rows;
+  $('voiceStatus').textContent=s.voice_rate+' bit/s · 收到 '+s.voice_packets+' 包 / '+s.voice_frames+' 帧 · CRC 错包 '+s.voice_crc_errors+' · UART 收/发 '+s.uart_rx_frames+'/'+s.uart_tx_frames+' · 丢队列 '+s.queue_drops+' · '+(s.uart_ready?'AP580 UART 已启用':'AP580 UART 尚未配置');$('voiceFrame').textContent='最近一帧：\n'+s.last_voice_frame;
   $('connection').textContent=paused?'已连接 · 显示暂停':'已连接 · '+(s.lock_state===3?'信号锁定':'等待信号');
   $('current').textContent=s.mode;$('frequency').textContent=s.tone_hz+' Hz';$('load').textContent=s.dsp_load_percent.toFixed(1)+'%';$('count').textContent=s.received_bytes+' B';
   $('diag').textContent='每载波 '+s.baud.toFixed(2)+' Baud · '+s.carriers+' 载波 · '+s.information_bps.toFixed(1)+' bit/s · 采样 '+s.samples_per_second+'/s · 最慢解调块 '+s.dsp_max_us+'/'+s.block_budget_us+' μs · 累计超预算 '+s.deadline_misses+' · 读错误 '+s.read_errors;
-  if(!editing&&!pending){$('mode').value=s.mode_id;$('tone').value=s.tone_hz;}
-  if(!paused){const r=await request('/api/rx?cursor='+cursor);const id=r.headers.get('X-Boot-Id');if(id!==boot){setBoot(id);delay=20;}else{
-    const bytes=new Uint8Array(await r.arrayBuffer());const lost=r.headers.get('X-Lost-Bytes');if(lost!=='0')append('\n[历史缓冲已覆盖 '+lost+' 字节]\n');
+  if(!editing&&!pending){$('kind').value=kind;fillModes(kind,s.mode_id);$('tone').value=s.tone_hz;}
+  if(!paused&&kind===1&&imageVersion!==s.image_version){const r=await request('/api/image');if(Number(r.headers.get('X-Content-Epoch'))===epoch){const url=URL.createObjectURL(await r.blob());$('image').src=url;if(imageUrl)URL.revokeObjectURL(imageUrl);imageUrl=url;imageVersion=Number(r.headers.get('X-Image-Version'));}}
+  if(!paused){const r=await request('/api/rx?cursor='+cursor);const id=r.headers.get('X-Boot-Id');if(id!==boot){setBoot(id);delay=20;}else if(Number(r.headers.get('X-Content-Epoch'))!==epoch){delay=20;}else{
+    const bytes=new Uint8Array(await r.arrayBuffer());const lost=r.headers.get('X-Lost-Bytes');if(lost!=='0'&&cursor!=='0'&&kind===0)append('\n[历史缓冲已覆盖 '+lost+' 字节]\n');
     let text='';for(const b of bytes)text+=(b===9||b===10||b===13||b>=32&&b<=126)?String.fromCharCode(b):'\\x'+b.toString(16).padStart(2,'0');
-    cursor=r.headers.get('X-Next-Cursor');if(text)append(text);if(bytes.length===1024)delay=20;
+    cursor=r.headers.get('X-Next-Cursor');if(kind===0&&text)append(text);if(kind===2&&bytes.length){const merged=new Uint8Array(voiceBytes.length+bytes.length);merged.set(voiceBytes);merged.set(bytes,voiceBytes.length);voiceBytes=merged.slice(-65536);}if(bytes.length===1024)delay=20;
   }}
 }catch(e){$('connection').textContent='连接中断 · 正在重试';delay=1500;}finally{setTimeout(poll,delay);}}
+function fillModes(type,selected=Number($('mode').value)){const allowed=modes.filter(m=>type===0||type===1&&m.image_allowed||type===2&&m.name==='2x8PSK1200F');const ids=allowed.map(m=>m.id).join(',');if($('mode').dataset.ids!==ids){$('mode').replaceChildren();for(const m of allowed){const o=document.createElement('option');o.value=m.id;o.textContent=m.name;$('mode').append(o);}$('mode').dataset.ids=ids;}if(allowed.some(m=>m.id===selected))$('mode').value=selected;else $('mode').value=allowed.at(-1)?.id??'';$('tone').disabled=type===2;$('mode').disabled=type===2;}
+$('kind').onchange=()=>{editing=true;fillModes(Number($('kind').value));if(Number($('kind').value)!==0)$('tone').value=2000;};
 $('mode').onchange=()=>{editing=true;if($('mode').selectedOptions[0].textContent==='2x8PSK1200F'){$('tone').value=2000;$('notice').textContent='双载波模式建议两端使用 2000 Hz，链路需覆盖约 0–4 kHz 音频。';}};
 $('tone').oninput=()=>{editing=true;};
-$('config').onsubmit=async e=>{e.preventDefault();pending=true;$('apply').disabled=true;try{await request('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:Number($('mode').value),tone_hz:Number($('tone').value)})});$('notice').textContent='已排队，当前状态将在接收机应用后更新。';editing=false;}catch(e){$('notice').textContent='设置失败，请检查连接后重试。';}finally{pending=false;$('apply').disabled=false;}};
+$('config').onsubmit=async e=>{e.preventDefault();pending=true;$('apply').disabled=true;try{await request('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:Number($('mode').value),tone_hz:Number($('tone').value),content_type:Number($('kind').value)})});$('notice').textContent='已排队，当前状态将在接收机应用后更新。';editing=false;}catch(e){$('notice').textContent='设置失败，请检查连接后重试。';}finally{pending=false;$('apply').disabled=false;}};
 $('pause').onclick=()=>{paused=!paused;$('pause').textContent=paused?'继续显示':'暂停显示';};
-$('clear').onclick=()=>{content='';$('text').textContent='';};
-$('save').onclick=()=>{const url=URL.createObjectURL(new Blob([content],{type:'text/plain;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download='psk-received.txt';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
+$('clear').onclick=()=>{content='';voiceBytes=new Uint8Array();$('text').textContent='';};
+$('save').onclick=()=>{if(kind===1&&!imageUrl){$('notice').textContent='图片尚未加载';return;}const url=kind===1?imageUrl:URL.createObjectURL(new Blob([kind===2?voiceBytes:content],{type:kind===2?'application/octet-stream':'text/plain;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download=kind===1?'psk-received.bmp':kind===2?'psk-ap580-frames.bin':'psk-received.txt';a.click();if(kind!==1)setTimeout(()=>URL.revokeObjectURL(url),1000);};
 poll();
 </script></html>

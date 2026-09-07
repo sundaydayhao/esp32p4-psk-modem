@@ -11,6 +11,7 @@
 #include "driver/gpio.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_log.h"
+#include "esp_crc.h"
 #include "psk_modes.h"
 
 static const char *TAG = "ui";
@@ -20,7 +21,7 @@ static size_t s_serial_cmd_len;
 static int s_dump_pending;
 
 #define UI_TX_TEXT_DEFAULT \
-    "CQ CQ CQ DE HPM6750 PSK MODEM. THIS IS A CONTINUOUS BOARD TO BOARD AUDIO LINK TEST AT 1500 HZ. COPY THE QUICK BROWN FOX 0123456789.\n"
+    "CQ CQ CQ DE HPM6750 PSK MODEM. THIS IS A CONTINUOUS BOARD TO BOARD AUDIO LINK TEST AT 2000 HZ. COPY THE QUICK BROWN FOX 0123456789.\n"
 
 typedef enum {
     UI_CYCLE_KIND_PSK,
@@ -68,6 +69,7 @@ static const ui_cycle_item_t s_mode_cycle[] = {
     { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_8PSK500F } },
     { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_8PSK1000F } },
     { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_8PSK1200F } },
+    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_2X8PSK1200F } },
 };
 
 static const tx_text_preset_t s_tx_text_presets[] = {
@@ -91,6 +93,7 @@ static const tx_text_preset_t s_tx_text_presets[] = {
 
 static int cycle_item_matches(const display_state_t *state, const ui_cycle_item_t *item)
 {
+    if (state->display_role) return item->kind == UI_CYCLE_KIND_PSK && state->selected_tx_psk_mode == item->value.psk_mode;
     if (item->kind == UI_CYCLE_KIND_MODE) {
         return state->selected_mode == item->value.modem_mode;
     }
@@ -102,6 +105,7 @@ static int cycle_item_matches(const display_state_t *state, const ui_cycle_item_
 
 static ui_event_t cycle_next_mode(const display_state_t *state)
 {
+    if (state->content_type == CONTENT_AUDIO) return (ui_event_t){.type = UI_EVENT_NONE};
     const size_t count = sizeof(s_mode_cycle) / sizeof(s_mode_cycle[0]);
     size_t current = 0;
     for (size_t i = 0; i < count; ++i) {
@@ -111,10 +115,21 @@ static ui_event_t cycle_next_mode(const display_state_t *state)
         }
     }
 
-    const ui_cycle_item_t *next = &s_mode_cycle[(current + 1U) % count];
+    const ui_cycle_item_t *next = NULL;
+    for (size_t step = 1; step <= count; ++step) {
+        const ui_cycle_item_t *item = &s_mode_cycle[(current + step) % count];
+        if (state->content_type == CONTENT_IMAGE &&
+            (item->kind != UI_CYCLE_KIND_PSK || !modem_image_mode_allowed(item->value.psk_mode))) continue;
+        next = item; break;
+    }
+    if (!next) return (ui_event_t){.type = UI_EVENT_NONE};
     ui_event_t event = { .type = next->kind == UI_CYCLE_KIND_PSK ? UI_EVENT_PSK_MODE_CHANGED : UI_EVENT_MODE_CHANGED };
     if (next->kind == UI_CYCLE_KIND_PSK) {
         event.psk_mode = next->value.psk_mode;
+        if (state->display_role) {
+            event.type = UI_EVENT_TX_MODE_CHANGED;
+            event.tx_psk_mode = next->value.psk_mode;
+        }
     } else {
         event.mode = next->value.modem_mode;
     }
@@ -210,9 +225,48 @@ static void print_capture_dump(void)
     }
 }
 
+/* Dedicated USB writes preserve binary bytes (stdout applies CR/LF conversion). */
+static int capture_usb_write(const void *data, size_t size)
+{
+    const uint8_t *bytes = data;
+    while (size) {
+        const int n = usb_serial_jtag_write_bytes(bytes, size > 128 ? 128 : size, pdMS_TO_TICKS(1000));
+        if (n <= 0) return 0;
+        bytes += n; size -= (size_t)n;
+    }
+    return 1;
+}
+
+static void print_capture_binary(void)
+{
+    audio_input_capture_stop();
+    int16_t samples[256];
+    const size_t count = audio_input_capture_count();
+    uint32_t crc = 0;
+    for (size_t offset = 0; offset < count; offset += 256) {
+        const size_t n = audio_input_capture_copy(offset, samples, 256);
+        crc = esp_crc32_le(crc, (const uint8_t *)samples, n * sizeof(*samples));
+    }
+    char header[80];
+    const int len = snprintf(header, sizeof(header), "[capbin] samples=%u crc=%08lx\n",
+                             (unsigned)count, (unsigned long)crc);
+    if (!capture_usb_write(header, len)) return;
+    for (size_t offset = 0; offset < count; offset += 256) {
+        const size_t n = audio_input_capture_copy(offset, samples, 256);
+        if (!capture_usb_write(samples, n * sizeof(*samples))) return;
+    }
+    capture_usb_write("[capbin-end]\n", 13);
+    usb_serial_jtag_wait_tx_done(pdMS_TO_TICKS(1000));
+}
+
 static int handle_capture_command(const char *command)
 {
     const char *arg = skip_spaces(command);
+    if (cmd_starts(arg, "CAPBIN")) {
+        s_dump_pending = 0;
+        print_capture_binary();
+        return 1;
+    }
     if (cmd_starts(arg, "CAPDUMP")) {
         s_dump_pending = 0;
         print_capture_dump();
@@ -229,7 +283,7 @@ static int handle_capture_command(const char *command)
                                       (is_dump ? 1U : 32768U);
     const size_t max_samples = is_dump ? (size_t)requested * 256U : (size_t)requested;
     if (audio_input_capture_start(max_samples) != ESP_OK) {
-        printf("[cap] error samples must be 1..32768\r\n");
+        printf("[cap] error: request must be 1..1920000 samples and fit available PSRAM\r\n");
         return 1;
     }
     s_dump_pending = is_dump;
@@ -311,8 +365,9 @@ static int parse_serial_control_command(const char *cmd, const display_state_t *
         return 1;
     }
 
-    if (cmd_starts(cmd, "TONE")) {
-        const char *arg = skip_command_arg(cmd, "TONE");
+    if (cmd_starts(cmd, "TONE") || cmd_starts(cmd, "TXTONE")) {
+        const bool tx_tone = cmd_starts(cmd, "TXTONE");
+        const char *arg = skip_command_arg(cmd, tx_tone ? "TXTONE" : "TONE");
         char *end = NULL;
         long tone_hz = strtol(arg, &end, 0);
         if (end == arg) {
@@ -324,7 +379,7 @@ static int parse_serial_control_command(const char *cmd, const display_state_t *
         } else if (tone_hz > 3500) {
             tone_hz = 3500;
         }
-        event->type = UI_EVENT_TONE_CHANGED;
+        event->type = tx_tone ? UI_EVENT_TX_TONE : UI_EVENT_TONE_CHANGED;
         event->tone_hz = (int)tone_hz;
         printf("[tone] selected %dHz\r\n", event->tone_hz);
         return 1;
@@ -342,10 +397,9 @@ static int parse_serial_control_command(const char *cmd, const display_state_t *
         for (size_t i = 0; i < sizeof(s_tx_text_presets) / sizeof(s_tx_text_presets[0]); ++i) {
             if (cmd_equals(arg, s_tx_text_presets[i].label) ||
                 (has_numeric_index && preset_index == i)) {
-                display_set_tx_text_selection((uint8_t)i);
                 event->type = UI_EVENT_TX_TEXT;
                 event->tx_psk_mode = display_state->selected_tx_psk_mode;
-                event->tx_tone_hz = display_state->tx_tone_hz > 0 ? display_state->tx_tone_hz : 1500;
+                event->tx_tone_hz = display_state->tx_tone_hz > 0 ? display_state->tx_tone_hz : 2000;
                 strncpy(event->tx_text, s_tx_text_presets[i].text, sizeof(event->tx_text) - 1);
                 event->tx_text[sizeof(event->tx_text) - 1] = '\0';
                 return 1;
@@ -361,7 +415,7 @@ static int parse_serial_control_command(const char *cmd, const display_state_t *
         const char *text = *arg ? arg : UI_TX_TEXT_DEFAULT;
         event->type = UI_EVENT_TX_TEXT;
         event->tx_psk_mode = display_state->selected_tx_psk_mode;
-        event->tx_tone_hz = display_state->tx_tone_hz > 0 ? display_state->tx_tone_hz : 1500;
+        event->tx_tone_hz = display_state->tx_tone_hz > 0 ? display_state->tx_tone_hz : 2000;
         strncpy(event->tx_text, text, sizeof(event->tx_text) - 1);
         event->tx_text[sizeof(event->tx_text) - 1] = '\0';
         return 1;
@@ -421,8 +475,28 @@ static int parse_serial_control_command(const char *cmd, const display_state_t *
         return 1;
     }
 
+    if (cmd_starts(cmd, "CONTENT")) {
+        const char *arg = skip_command_arg(cmd, "CONTENT");
+        const char *names[] = {"TEXT", "IMAGE", "AUDIO"};
+        for (int i = 0; i < CONTENT_COUNT; ++i) {
+            if (cmd_equals(arg, names[i])) {
+                event->type = UI_EVENT_CONTENT_CHANGED; event->content_type = i; return 1;
+            }
+        }
+        printf("[cmd] CONTENT TEXT|IMAGE|AUDIO\r\n"); return 1;
+    }
+    if (cmd_starts(cmd, "APRATE") || cmd_starts(cmd, "AP580RATE")) {
+        const char *key = cmd_starts(cmd, "APRATE") ? "APRATE" : "AP580RATE";
+        unsigned rate = 0;
+        if (parse_uint_arg(skip_command_arg(cmd, key), &rate) &&
+            (rate == 600 || rate == 1200 || rate == 2400)) {
+            event->type = UI_EVENT_VOICE_RATE; event->codec_rate = rate; return 1;
+        }
+        printf("[cmd] APRATE 600|1200|2400; match AP580 jumpers\r\n"); return 1;
+    }
+
     if (cmd_starts(cmd, "STATUS")) {
-        printf("[status] role=%s rxmode=%s psk=%s txmode=%s tone=%dHz txtone=%dHz tx=%d/%u\r\n",
+        printf("[status] role=%s rxmode=%s psk=%s txmode=%s tone=%dHz txtone=%dHz tx=%d/%u content=%s rate=%lu\r\n",
                display_state->display_role ? "TX" : "RX",
                modem_mode_name(display_state->selected_mode),
                psk_mode_name(display_state->selected_psk_mode),
@@ -430,7 +504,8 @@ static int parse_serial_control_command(const char *cmd, const display_state_t *
                display_state->rx_tone_hz,
                display_state->tx_tone_hz,
                display_state->tx_active,
-               (unsigned)display_state->tx_queued);
+               (unsigned)display_state->tx_queued, content_name(display_state->content_type),
+               (unsigned long)display_state->codec_rate);
         return 1;
     }
 
@@ -516,6 +591,11 @@ ui_event_t ui_poll(const display_state_t *display_state)
         return event;
     }
 
+    content_type_t content;
+    if (display_take_content_selection(&content)) {
+        event.type = UI_EVENT_CONTENT_CHANGED; event.content_type = content; return event;
+    }
+
     psk_mode_t display_psk_mode;
     if (display_take_mode_selection(&display_psk_mode)) {
         if (display_state->display_role) {
@@ -528,33 +608,10 @@ ui_event_t ui_poll(const display_state_t *display_state)
         return event;
     }
 
-    uint8_t tx_text_index;
-    if (display_take_tx_text_selection(&tx_text_index)) {
-        if (tx_text_index < sizeof(s_tx_text_presets) / sizeof(s_tx_text_presets[0])) {
-            display_set_tx_text_selection(tx_text_index);
-            event.type = UI_EVENT_TX_TEXT;
-            event.tx_psk_mode = display_state->selected_tx_psk_mode;
-            event.tx_tone_hz = display_state->tx_tone_hz > 0 ? display_state->tx_tone_hz : 1500;
-            strncpy(event.tx_text, s_tx_text_presets[tx_text_index].text,
-                    sizeof(event.tx_text) - 1);
-            event.tx_text[sizeof(event.tx_text) - 1] = '\0';
-            return event;
-        }
-    }
-
     int tone_hz;
     if (display_take_tone_selection(&tone_hz)) {
-        if (display_state->display_role) {
-            event.type = UI_EVENT_TX_TEXT;
-            event.tx_psk_mode = display_state->selected_tx_psk_mode;
-            event.tx_tone_hz = tone_hz;
-            const size_t text_len = strnlen(display_state->tx_text, sizeof(event.tx_text) - 1);
-            memcpy(event.tx_text, display_state->tx_text, text_len);
-            event.tx_text[text_len] = '\0';
-        } else {
-            event.type = UI_EVENT_TONE_CHANGED;
-            event.tone_hz = tone_hz;
-        }
+        event.type = display_state->display_role ? UI_EVENT_TX_TONE : UI_EVENT_TONE_CHANGED;
+        event.tone_hz = tone_hz;
         return event;
     }
 

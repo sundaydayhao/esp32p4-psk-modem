@@ -39,6 +39,8 @@ static void backend_init(psk_rx_t *m)
         .userdata = m,
     };
     psk_rtty_rx_init(&m->rx, &cfg);
+    m->rx.binary_mode = m->binary_mode;
+    m->rx.binary_sync_word = m->binary_sync_word;
     m->rx.sq_thresh = m->config.squelch;
     m->rx.afc_enabled = m->config.afc_enabled ? 1 : 0;
     m->rx.squelch_enabled = m->config.squelch_enabled ? 1 : 0;
@@ -53,6 +55,7 @@ static int backend_effective_tone_hz(const psk_rx_t *m)
     if (!m->backend_active) {
         return m->config.rx_tone_hz;
     }
+    if (m->rx.carriers > 1U) return m->config.rx_tone_hz;
     float phase_inc = m->rx.nco_phase_inc + m->rx.freq_error;
     if (!m->rx.afc_enabled || m->rx.carriers != 1U) {
         phase_inc = m->rx.carrier_phase_inc[0];
@@ -198,6 +201,7 @@ void psk_rx_debug_snapshot(const psk_rx_t *m, psk_rx_debug_t *debug)
     debug->timing_adjusts = m->rx.debug_timing_adjusts;
     debug->soft_ambiguous = m->rx.debug_soft_ambiguous;
     debug->coarse_updates = m->rx.debug_coarse_updates;
+    debug->fec_reacquires = m->rx.debug_fec_reacquires;
     debug->valid_frames = 0U;
     debug->invalid_frames = 0U;
     debug->frame_sync_events = 0U;
@@ -226,4 +230,28 @@ size_t psk_rx_process(psk_rx_t *m, const int16_t *samples, size_t count,
     psk_rtty_rx_feed(&m->rx, samples, count);
     m->out = NULL;
     return m->out_len;
+}
+
+void psk_rx_set_binary_sync(psk_rx_t *m, uint32_t sync_word)
+{
+    m->binary_mode = sync_word != 0U ? 1U : 0U;
+    m->binary_sync_word = sync_word;
+    m->rx.binary_mode = m->binary_mode;
+    m->rx.binary_sync_word = sync_word;
+    m->rx.binary_bit_count = 0U;
+    m->rx.binary_sync_bit_count = 0U;
+    m->rx.binary_synced = 0U;
+    m->rx.binary_sync_shift = 0U;
+    m->rx.bit_acc = 0U;
+}
+void psk_rx_reacquire_binary(psk_rx_t *m)
+{
+    if (!m || !m->binary_mode || m->binary_sync_word == 0U) {
+        return;
+    }
+    m->rx.binary_bit_count = 0U;
+    m->rx.binary_sync_bit_count = 0U;
+    m->rx.binary_synced = 0U;
+    m->rx.binary_sync_shift = 0U;
+    m->rx.bit_acc = 0U;
 }

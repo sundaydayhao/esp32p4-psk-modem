@@ -13,6 +13,8 @@
 #include "esp_check.h"
 #include "esp_codec_dev.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
 #include "esp_timer.h"
 
 static const char *TAG = "audio";
@@ -24,27 +26,25 @@ static uint8_t s_dac_volume = 70;
 static uint8_t s_headphone_volume = 70;
 static float s_input_gain_db = BOARD_AUDIO_INPUT_GAIN_DB;
 
-#define AUDIO_INPUT_CAPTURE_MAX_SAMPLES 131072U
-static int16_t s_capture[AUDIO_INPUT_CAPTURE_MAX_SAMPLES] EXT_RAM_BSS_ATTR;
+#define AUDIO_INPUT_CAPTURE_MAX_SAMPLES (48000U * 40U)
+static int16_t *s_capture;
+static portMUX_TYPE s_capture_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile size_t s_capture_limit;
 static volatile size_t s_capture_count;
 static volatile bool s_capture_active;
 
 static void capture_samples(const int16_t *samples, size_t count)
 {
-    if (!s_capture_active || !samples || count == 0) {
-        return;
+    if (!samples || count == 0) return;
+    portENTER_CRITICAL(&s_capture_mux);
+    if (s_capture_active) {
+        const size_t remaining = s_capture_limit - s_capture_count;
+        if (count > remaining) count = remaining;
+        memcpy(s_capture + s_capture_count, samples, count * sizeof(*samples));
+        s_capture_count += count;
+        if (s_capture_count == s_capture_limit) s_capture_active = false;
     }
-
-    size_t captured = s_capture_count;
-    const size_t limit = s_capture_limit;
-    for (size_t i = 0; i < count && captured < limit; ++i) {
-        s_capture[captured++] = samples[i];
-    }
-    s_capture_count = captured;
-    if (captured >= limit) {
-        s_capture_active = false;
-    }
+    portEXIT_CRITICAL(&s_capture_mux);
 }
 
 esp_err_t audio_input_init(void)
@@ -232,16 +232,24 @@ esp_err_t audio_input_capture_start(size_t max_samples)
         return ESP_ERR_INVALID_SIZE;
     }
 
-    s_capture_active = false;
+    int16_t *buffer = heap_caps_malloc(max_samples * sizeof(*buffer), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buffer) return ESP_ERR_NO_MEM;
+    portENTER_CRITICAL(&s_capture_mux);
+    int16_t *old = s_capture;
+    s_capture = buffer;
     s_capture_count = 0;
     s_capture_limit = max_samples;
     s_capture_active = true;
+    portEXIT_CRITICAL(&s_capture_mux);
+    heap_caps_free(old);
     return ESP_OK;
 }
 
 void audio_input_capture_stop(void)
 {
+    portENTER_CRITICAL(&s_capture_mux);
     s_capture_active = false;
+    portEXIT_CRITICAL(&s_capture_mux);
 }
 
 int audio_input_capture_active(void)
@@ -256,14 +264,12 @@ size_t audio_input_capture_count(void)
 
 size_t audio_input_capture_copy(size_t offset, int16_t *samples, size_t max_samples)
 {
+    if (!samples || !max_samples) return 0;
+    portENTER_CRITICAL(&s_capture_mux);
     const size_t count = s_capture_count;
-    if (!samples || offset >= count || max_samples == 0) {
-        return 0;
-    }
-    size_t copied = count - offset;
-    if (copied > max_samples) {
-        copied = max_samples;
-    }
-    memcpy(samples, &s_capture[offset], copied * sizeof(samples[0]));
+    size_t copied = offset < count ? count - offset : 0;
+    if (copied > max_samples) copied = max_samples;
+    if (copied) memcpy(samples, &s_capture[offset], copied * sizeof(samples[0]));
+    portEXIT_CRITICAL(&s_capture_mux);
     return copied;
 }

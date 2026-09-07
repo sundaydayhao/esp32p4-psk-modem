@@ -12,6 +12,7 @@
 #include "esp_attr.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -39,19 +40,12 @@ typedef struct {
     uint32_t sequence;
 } spectrum_msg_t;
 
-typedef enum {
-    TX_CMD_SET_MODE,
-    TX_CMD_START_TEXT,
-    TX_CMD_SET_OUTPUT_GAIN,
-    TX_CMD_STOP,
-} tx_cmd_type_t;
-
 typedef struct {
-    tx_cmd_type_t type;
     psk_mode_t mode;
-    int tone_hz;
-    int dac_volume;
-    int hp_volume;
+    int tone_hz, dac_volume, hp_volume;
+    content_type_t content;
+    bool enabled;
+    uint32_t epoch, codec_rate;
     char text[256];
 } tx_cmd_t;
 
@@ -59,7 +53,9 @@ static QueueHandle_t s_decoded_queue;
 static QueueHandle_t s_control_queue;
 static QueueHandle_t s_spectrum_queue;
 static QueueHandle_t s_tx_queue;
-static modem_t s_audio_modem;
+/* The decoder includes large, inactive MFSK/RTTY workspaces; cache its active
+ * PSK state in PSRAM and reserve internal SRAM for Viterbi metrics. */
+static modem_t s_audio_modem EXT_RAM_BSS_ATTR;
 static int16_t s_audio_samples[256];
 static char s_audio_decoded[sizeof(((decoded_msg_t *)0)->text)];
 static volatile int s_display_role;
@@ -89,6 +85,18 @@ static waterfall_stream_t s_rx_waterfall;
 static waterfall_stream_t s_tx_waterfall;
 static psk_tx_t s_tx_modem EXT_RAM_BSS_ATTR;
 static int16_t s_tx_samples[PSK_TX_CHUNK_SAMPLES] EXT_RAM_BSS_ATTR;
+
+#if CONFIG_PSK_AP580_RATE_1200
+#define DEFAULT_VOICE_RATE 1200U
+#elif CONFIG_PSK_AP580_RATE_2400
+#define DEFAULT_VOICE_RATE 2400U
+#else
+#define DEFAULT_VOICE_RATE 600U
+#endif
+/* Only audio_task applies controls. TX owns its modulator; UART owns its driver. */
+static tx_cmd_t s_settings = {.mode = PSK_MODE_BPSK31, .tone_hz = 2000,
+    .dac_volume = 70, .hp_volume = 70, .content = CONTENT_TEXT,
+    .codec_rate = DEFAULT_VOICE_RATE, .text = TX_TEXT_DEFAULT};
 
 static void waterfall_stream_init(waterfall_stream_t *stream);
 static void append_waterfall_stream(waterfall_stream_t *stream, uint32_t source_key,
@@ -128,28 +136,100 @@ static void publish_decoded_text(const char *decoded, size_t decoded_len)
     (void)xQueueSend(s_decoded_queue, &msg, 0);
 }
 
+static void publish_settings(modem_t *modem, rx_web_status_t *status)
+{
+    status->mode = modem_get_psk_mode(modem); status->tone_hz = modem->config.rx_tone_hz;
+    status->content_type = s_settings.content; status->content_epoch = s_settings.epoch;
+    status->codec_rate = s_settings.codec_rate; status->tx_mode = s_settings.mode;
+    status->tx_tone_hz = s_settings.tone_hz; status->display_role = s_display_role;
+    status->tx_enabled = s_settings.enabled;
+    memcpy(status->tx_text, s_settings.text, sizeof(status->tx_text));
+    rx_web_set_status(status);
+}
+static void begin_session(modem_t *modem)
+{
+    ++s_settings.epoch;
+    psk_rx_reset(&modem->decoder.psk_rx);
+    psk_rx_set_binary_sync(&modem->decoder.psk_rx,
+                          s_settings.content == CONTENT_AUDIO ? VOICE_SYNC_WORD : 0);
+    content_begin(s_settings.content, s_display_role != 0, s_settings.enabled,
+                  s_settings.codec_rate, s_settings.epoch);
+    (void)xQueueOverwrite(s_tx_queue, &s_settings);
+    ESP_LOGI(TAG, "session %lu: %s/%s RX=%s TX=%s rate=%lu",
+             (unsigned long)s_settings.epoch, content_name(s_settings.content), s_display_role ? "TX" : "RX",
+             psk_mode_name(modem_get_psk_mode(modem)), psk_mode_name(s_settings.mode),
+             (unsigned long)s_settings.codec_rate);
+}
+static void select_content(modem_t *modem, content_type_t type)
+{
+    const content_type_t old = s_settings.content;
+    s_settings.content = type;
+    if (type == CONTENT_AUDIO) {
+        modem_set_psk_mode(modem, PSK_MODE_2X8PSK1200F); s_settings.mode = PSK_MODE_2X8PSK1200F;
+        modem_set_rx_tone(modem, 2000); s_settings.tone_hz = 2000;
+    } else if (type == CONTENT_IMAGE) {
+        if (!modem_image_mode_allowed(modem_get_psk_mode(modem)))
+            modem_set_psk_mode(modem, PSK_MODE_2X8PSK1200F);
+        if (!modem_image_mode_allowed(s_settings.mode)) s_settings.mode = PSK_MODE_2X8PSK1200F;
+    } else if (old == CONTENT_AUDIO) {
+        modem_set_psk_mode(modem, PSK_MODE_BPSK31); s_settings.mode = PSK_MODE_BPSK31;
+    }
+}
+static bool mode_allowed(content_type_t content, psk_mode_t mode)
+{
+    return (unsigned)mode < PSK_MODE_COUNT &&
+        (content != CONTENT_IMAGE || modem_image_mode_allowed(mode)) &&
+        (content != CONTENT_AUDIO || mode == PSK_MODE_2X8PSK1200F);
+}
 static void apply_control_event(modem_t *modem, const ui_event_t *event)
 {
     switch (event->type) {
-    case UI_EVENT_RX_CONFIG:
-        modem_set_psk_mode(modem, event->psk_mode);
-        modem_set_rx_tone(modem, event->tone_hz);
+    case UI_EVENT_RX_CONFIG: {
+        const content_type_t type = event->content_type < 0 ? s_settings.content : (content_type_t)event->content_type;
+        if ((unsigned)type >= CONTENT_COUNT || !mode_allowed(type, event->psk_mode)) return;
+        if (type == CONTENT_AUDIO && event->tone_hz != 2000) return;
+        if (type != s_settings.content) select_content(modem, type);
+        modem_set_psk_mode(modem, event->psk_mode); modem_set_rx_tone(modem, event->tone_hz);
+        s_display_role = 0; s_settings.enabled = false;
         break;
+    }
+    case UI_EVENT_CONTENT_CHANGED:
+        if ((unsigned)event->content_type >= CONTENT_COUNT) return;
+        select_content(modem, (content_type_t)event->content_type); break;
+    case UI_EVENT_VOICE_RATE:
+        if (event->codec_rate != 600 && event->codec_rate != 1200 && event->codec_rate != 2400) return;
+        s_settings.codec_rate = event->codec_rate; break;
     case UI_EVENT_MODE_CHANGED:
-        modem_set_mode(modem, event->mode);
-        break;
+        if (s_settings.content != CONTENT_TEXT) return;
+        modem_set_mode(modem, event->mode); break;
     case UI_EVENT_PSK_MODE_CHANGED:
-        modem_set_psk_mode(modem, event->psk_mode);
-        break;
+        if (!mode_allowed(s_settings.content, event->psk_mode)) return;
+        modem_set_psk_mode(modem, event->psk_mode); break;
+    case UI_EVENT_TX_MODE_CHANGED:
+        if (!mode_allowed(s_settings.content, event->tx_psk_mode)) return;
+        s_settings.mode = event->tx_psk_mode; break;
     case UI_EVENT_TRANSPORT_CHANGED:
-        transport_set_mode(event->transport_mode);
-        break;
+        (void)transport_set_mode(event->transport_mode); return;
     case UI_EVENT_TONE_CHANGED:
-        modem_set_rx_tone(modem, event->tone_hz);
-        break;
+        if (s_settings.content == CONTENT_AUDIO) return;
+        modem_set_rx_tone(modem, event->tone_hz); break;
+    case UI_EVENT_TX_TONE:
+        if (s_settings.content == CONTENT_AUDIO) return;
+        s_settings.tone_hz = event->tone_hz; break;
+    case UI_EVENT_DISPLAY_ROLE_CHANGED:
+        s_display_role = event->display_role != 0; s_settings.enabled = s_display_role != 0; break;
+    case UI_EVENT_TX_STOP:
+        s_settings.enabled = false; break;
+    case UI_EVENT_TX_TEXT:
+        if (s_settings.content != CONTENT_TEXT) return;
+        s_settings.mode = event->tx_psk_mode; s_settings.tone_hz = event->tx_tone_hz;
+        snprintf(s_settings.text, sizeof(s_settings.text), "%s", event->tx_text);
+        s_display_role = 1; s_settings.enabled = true; break;
+    case UI_EVENT_OUTPUT_GAIN:
+        s_settings.dac_volume = event->output_dac_volume; s_settings.hp_volume = event->output_hp_volume;
+        (void)xQueueOverwrite(s_tx_queue, &s_settings); return;
     case UI_EVENT_INPUT_GAIN:
-        (void)audio_input_set_gain_db(event->input_gain_db);
-        break;
+        (void)audio_input_set_gain_db(event->input_gain_db); return;
     case UI_EVENT_RX_DIAG: {
         psk_rx_debug_t rx_debug;
         psk_rx_debug_snapshot(&modem->decoder.psk_rx, &rx_debug);
@@ -175,27 +255,29 @@ static void apply_control_event(modem_t *modem, const ui_event_t *event)
                  rx_debug.timing_peak, rx_debug.timing_target, rx_debug.timing_bins,
                  (unsigned)rx_debug.valid_frames, (unsigned)rx_debug.invalid_frames,
                  (unsigned)rx_debug.frame_sync_events);
-        break;
+        content_status_t cs; content_get_status(&cs);
+        ESP_LOGI(TAG, "content=%s epoch=%lu image=%lu/96 bad=%lu voice=%lu packets=%lu crc=%lu UART=%s in=%lu out=%lu",
+                 content_name(s_settings.content), (unsigned long)s_settings.epoch,
+                 (unsigned long)cs.image_rows, (unsigned long)cs.image_bad_rows, (unsigned long)cs.voice_frames,
+                 (unsigned long)cs.voice_packets, (unsigned long)cs.voice_crc_errors,
+                 cs.uart_ready ? "ready" : "unconfigured", (unsigned long)cs.uart_rx_frames, (unsigned long)cs.uart_tx_frames);
+        rx_web_status_t performance; rx_web_get_status(&performance);
+        ESP_LOGI(TAG, "perf load=%u.%u%% max=%u/%uus late=%lu samples/s=%u readerr=%lu image_completed=%lu",
+            performance.dsp_load_permille / 10, performance.dsp_load_permille % 10,
+            performance.dsp_max_us, performance.block_budget_us, (unsigned long)performance.deadline_misses,
+            performance.samples_per_second, (unsigned long)performance.read_errors, (unsigned long)cs.image_completed);
+        ESP_LOGI(TAG, "heap internal=%u largest=%u PSRAM=%u fec_reacquires=%lu usb_dropped=%llu",
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), (unsigned long)rx_debug.fec_reacquires,
+            (unsigned long long)transport_usb_dropped_bytes());
+        return;
     }
     case UI_EVENT_RX_FEC_BRANCH:
-        psk_rx_set_fec_branch_override(&modem->decoder.psk_rx, event->fec_branch_override);
-        ESP_LOGI(TAG, "fec branch override applied: %d", event->fec_branch_override);
-        break;
-    case UI_EVENT_TX_MODE_CHANGED:
-    case UI_EVENT_DISPLAY_ROLE_CHANGED:
-    case UI_EVENT_TX_TEXT:
-    case UI_EVENT_OUTPUT_GAIN:
-    case UI_EVENT_NONE:
-    default:
-        break;
+        psk_rx_set_fec_branch_override(&modem->decoder.psk_rx, event->fec_branch_override); return;
+    default: return;
     }
-}
-
-static void send_tx_cmd(const tx_cmd_t *cmd)
-{
-    if (s_tx_queue && cmd) {
-        (void)xQueueSend(s_tx_queue, cmd, 0);
-    }
+    begin_session(modem);
 }
 
 static void waterfall_stream_init(waterfall_stream_t *stream)
@@ -316,100 +398,51 @@ static void clear_display_spectrum(spectrum_t *spectrum)
 static void tx_task(void *arg)
 {
     (void)arg;
-
     psk_tx_t *tx = &s_tx_modem;
     psk_tx_init(tx, BOARD_CODEC_SAMPLE_RATE_HZ);
-    psk_mode_t tx_mode = PSK_MODE_BPSK31;
-    int tx_tone_hz = 2000;
-    char tx_text[sizeof(((tx_cmd_t *)0)->text)] = TX_TEXT_DEFAULT;
-    uint8_t tx_loop_enabled = 0U;
-
+    tx_cmd_t config = {.epoch = UINT32_MAX};
+    modem_image_tx_stream_t image_stream = {0};
+    voice_tx_stream_t voice_stream = {0};
     ESP_LOGI(TAG, "tx task started");
-
-    while (true) {
-        tx_cmd_t cmd;
-        while (xQueueReceive(s_tx_queue, &cmd, 0) == pdTRUE) {
-            switch (cmd.type) {
-            case TX_CMD_SET_MODE:
-                tx_mode = cmd.mode;
-                if (tx_loop_enabled) {
-                    psk_tx_stop(tx);
-                    audio_output_clear();
-                    waterfall_stream_init(&s_tx_waterfall);
-                    if (psk_tx_start_text_loop(tx, tx_mode, tx_tone_hz, tx_text) != 0) {
-                        tx_loop_enabled = 0U;
-                    }
-                }
-                break;
-            case TX_CMD_SET_OUTPUT_GAIN:
-                (void)audio_output_set_codec_gain((uint8_t)cmd.dac_volume, (uint8_t)cmd.hp_volume);
-                break;
-            case TX_CMD_START_TEXT:
-                tx_mode = cmd.mode;
-                tx_tone_hz = cmd.tone_hz > 0 ? cmd.tone_hz : 2000;
-                if (cmd.text[0] != '\0') {
-                    strncpy(tx_text, cmd.text, sizeof(tx_text) - 1U);
-                    tx_text[sizeof(tx_text) - 1U] = '\0';
-                }
-                audio_output_clear();
-                waterfall_stream_init(&s_tx_waterfall);
-                if (psk_tx_start_text_loop(tx, tx_mode, tx_tone_hz, tx_text) == 0) {
-                    tx_loop_enabled = 1U;
-                    s_tx_active = 1;
-                    ESP_LOGI(TAG, "tx start mode=%s tone=%d text='%s'",
-                             psk_mode_name(tx_mode), tx_tone_hz, tx_text);
-                } else {
-                    tx_loop_enabled = 0U;
-                    s_tx_active = 0;
-                    ESP_LOGW(TAG, "tx start failed mode=%s text_len=%u",
-                             psk_mode_name(tx_mode), (unsigned)strlen(tx_text));
-                }
-                break;
-            case TX_CMD_STOP:
-                tx_loop_enabled = 0U;
-                psk_tx_stop(tx);
-                audio_output_clear();
-                waterfall_stream_init(&s_tx_waterfall);
-                s_tx_active = 0;
-                ESP_LOGI(TAG, "tx stop");
-                break;
-            default:
-                break;
+    for (;;) {
+        tx_cmd_t next;
+        if (xQueueReceive(s_tx_queue, &next, 0) == pdTRUE) {
+            (void)audio_output_set_codec_gain((uint8_t)next.dac_volume, (uint8_t)next.hp_volume);
+            if (next.epoch != config.epoch) {
+                psk_tx_stop(tx); audio_output_clear(); waterfall_stream_init(&s_tx_waterfall);
+                modem_image_tx_stream_reset(&image_stream);
+                voice_stream = (voice_tx_stream_t){.epoch = next.epoch};
             }
+            config = next;
         }
-
-        if (!psk_tx_active(tx) && tx_loop_enabled) {
-            if (psk_tx_start_text_loop(tx, tx_mode, tx_tone_hz, tx_text) != 0) {
-                tx_loop_enabled = 0U;
-            }
+        if (config.enabled && !psk_tx_active(tx)) {
+            int rc = 0;
+            if (config.content == CONTENT_AUDIO) {
+                if (content_voice_tx_ready(config.epoch))
+                    rc = psk_tx_start_binary_stream(tx, PSK_MODE_2X8PSK1200F, config.tone_hz,
+                                                   content_voice_tx_fetch, &voice_stream);
+            } else if (config.content == CONTENT_IMAGE) {
+                rc = psk_tx_start_stream(tx, config.mode, config.tone_hz, modem_image_tx_stream_fetch, &image_stream);
+            } else rc = psk_tx_start_text_loop(tx, config.mode, config.tone_hz, config.text);
+            if (rc != 0) { ESP_LOGE(TAG, "TX start failed: %s", content_name(config.content)); config.enabled = false; }
         }
-
         if (psk_tx_active(tx)) {
-            const size_t generated = psk_tx_generate(tx, s_tx_samples,
-                                                     sizeof(s_tx_samples) / sizeof(s_tx_samples[0]));
-            if (generated > 0) {
-                const size_t written = audio_output_write(s_tx_samples, generated);
-                s_tx_queued = audio_output_queued();
-                append_waterfall_stream(&s_tx_waterfall, WATERFALL_SOURCE_TX, s_tx_samples,
-                                        generated, BOARD_CODEC_SAMPLE_RATE_HZ);
-                if (written == 0) {
-                    vTaskDelay(pdMS_TO_TICKS(2));
-                }
+            const size_t n = psk_tx_generate(tx, s_tx_samples, PSK_TX_CHUNK_SAMPLES);
+            if (n) {
+                (void)audio_output_write(s_tx_samples, n);
+                append_waterfall_stream(&s_tx_waterfall, WATERFALL_SOURCE_TX,
+                                        s_tx_samples, n, BOARD_CODEC_SAMPLE_RATE_HZ);
             }
-        } else {
-            s_tx_queued = audio_output_queued();
-            vTaskDelay(pdMS_TO_TICKS(2));
-        }
-
-        s_tx_active = (tx_loop_enabled || psk_tx_active(tx) || audio_output_queued() > 0U) ? 1 : 0;
-
+        } else vTaskDelay(pdMS_TO_TICKS(2));
+        s_tx_active = psk_tx_active(tx); s_tx_queued = audio_output_queued();
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
-static bool web_configure_receiver(psk_mode_t mode, int tone_hz)
+static bool web_configure_receiver(psk_mode_t mode, int tone_hz, int content_type)
 {
-    const ui_event_t event = {.type = UI_EVENT_RX_CONFIG, .psk_mode = mode, .tone_hz = tone_hz};
+    const ui_event_t event = {.type = UI_EVENT_RX_CONFIG, .psk_mode = mode,
+                              .tone_hz = tone_hz, .content_type = content_type};
     return s_control_queue && xQueueSend(s_control_queue, &event, 0) == pdTRUE;
 }
 
@@ -423,6 +456,8 @@ static void audio_task(void *arg)
     modem_t *modem = &s_audio_modem;
     modem_init(modem, &config);
     rx_web_status_t status = {0};
+    begin_session(modem);
+    publish_settings(modem, &status);
     uint64_t dsp_sum = 0, dsp_samples = 0;
     uint32_t samples = 0, dsp_max = 0;
     uint8_t input_open = 0, closed_blocks = 0;
@@ -433,9 +468,7 @@ static void audio_task(void *arg)
         /* Bound control work so clients cannot starve I2S by flooding commands. */
         for (unsigned i = 0; i < 4 && xQueueReceive(s_control_queue, &event, 0) == pdTRUE; ++i) {
             apply_control_event(modem, &event);
-            status.mode = modem_get_psk_mode(modem);
-            status.tone_hz = modem->config.rx_tone_hz;
-            rx_web_set_status(&status);
+            publish_settings(modem, &status);
         }
         const size_t count = audio_input_read(s_audio_samples,
             sizeof(s_audio_samples)/sizeof(s_audio_samples[0]), 50);
@@ -447,6 +480,8 @@ static void audio_task(void *arg)
             if (s_input_abs_avg >= RX_INPUT_OPEN_ABS_AVG) {
                 if (!input_open) {
                     modem_set_psk_mode(modem, modem_get_psk_mode(modem));
+                    psk_rx_set_binary_sync(&modem->decoder.psk_rx,
+                        s_settings.content == CONTENT_AUDIO ? VOICE_SYNC_WORD : 0);
                     input_open = 1;
                 }
                 closed_blocks = 0;
@@ -456,7 +491,7 @@ static void audio_task(void *arg)
                 input_open = 0;
             }
             status.block_budget_us = (uint32_t)((uint64_t)count * 1000000 / BOARD_MODEM_SAMPLE_RATE_HZ);
-            if (input_open) {
+            if (input_open && !s_display_role) {
                 const int64_t start = esp_timer_get_time();
                 const size_t len = modem_process(modem, s_audio_samples, count,
                                                  s_audio_decoded, sizeof(s_audio_decoded));
@@ -465,7 +500,9 @@ static void audio_task(void *arg)
                 dsp_samples += count;
                 if (elapsed > dsp_max) dsp_max = elapsed;
                 if (elapsed > status.block_budget_us) ++status.deadline_misses;
-                publish_decoded_text(s_audio_decoded, len);
+                if (s_settings.content == CONTENT_TEXT) publish_decoded_text(s_audio_decoded, len);
+                else if (content_receive((const uint8_t *)s_audio_decoded, len))
+                    psk_rx_reacquire_binary(&modem->decoder.psk_rx);
             }
         } else {
             ++status.read_errors;
@@ -483,7 +520,7 @@ static void audio_task(void *arg)
             status.samples_per_second = (unsigned)((uint64_t)samples * 1000000 / window);
             status.dsp_load_permille = dsp_samples ? (unsigned)(dsp_sum * BOARD_MODEM_SAMPLE_RATE_HZ / (dsp_samples * 1000)) : 0;
             status.dsp_max_us = dsp_max;
-            rx_web_set_status(&status);
+            publish_settings(modem, &status);
 #if BOARD_MODEM_DEBUG_LOGS
             ESP_LOGI(TAG, "RX %s load=%u.%u%% max=%uus budget=%uus late=%" PRIu32 " samples/s=%u",
                      psk_mode_name(status.mode), status.dsp_load_permille/10,
@@ -503,213 +540,50 @@ static void audio_task(void *arg)
 
 static void ui_task(void *arg)
 {
-    static display_state_t display_state EXT_RAM_BSS_ATTR;
+    (void)arg;
+    static display_state_t state EXT_RAM_BSS_ATTR;
     static spectrum_t spectrum EXT_RAM_BSS_ATTR;
     static spectrum_msg_t spectrum_msg EXT_RAM_BSS_ATTR;
-
-    (void)arg;
-
-    memset(&display_state, 0, sizeof(display_state));
-    display_state.selected_mode = MODEM_MODE_BPSK31;
-    display_state.selected_psk_mode = PSK_MODE_BPSK31;
-    display_state.selected_tx_psk_mode = PSK_MODE_BPSK31;
-    display_state.transport_mode = TRANSPORT_MODE_USB_SERIAL;
-    display_state.rx_tone_hz = 2000;
-    display_state.tx_tone_hz = 2000;
-    strncpy(display_state.tx_text, TX_TEXT_DEFAULT, sizeof(display_state.tx_text) - 1U);
-    display_state.tx_text[sizeof(display_state.tx_text) - 1U] = '\0';
-
-    uint32_t last_waterfall_sequence = 0U;
-    uint32_t last_waterfall_source_key = 0xffffffffUL;
-    uint32_t last_waterfall_sample_rate_hz = 0U;
-    int64_t last_render_us = 0;
-    psk_mode_t last_rx_mode = PSK_MODE_BPSK31;
-    int last_rx_tone = 2000;
-
-    clear_display_spectrum(&spectrum);
-    ESP_LOGI(TAG, "ui task started");
-
-    while (true) {
-        decoded_msg_t msg;
-        while (xQueueReceive(s_decoded_queue, &msg, 0) == pdTRUE) {
-            display_append_text(&display_state, msg.text);
-        }
-
+    uint32_t last_sequence = 0, last_source = UINT32_MAX, epoch = UINT32_MAX;
+    int64_t last_render = 0;
+    for (;;) {
         rx_web_status_t actual;
         rx_web_get_status(&actual);
-        if (actual.mode != last_rx_mode || actual.tone_hz != last_rx_tone) {
-            last_rx_mode = actual.mode; last_rx_tone = actual.tone_hz;
-            display_state.selected_psk_mode = actual.mode;
-            display_state.selected_mode = actual.mode == PSK_MODE_BPSK31 ? MODEM_MODE_BPSK31 : MODEM_MODE_PSK63;
-            display_state.rx_tone_hz = actual.tone_hz;
+        if (epoch != actual.content_epoch) {
+            epoch = actual.content_epoch;
+            state.text_len = 0; state.text[0] = 0;
+            xQueueReset(s_decoded_queue); clear_display_spectrum(&spectrum);
+            last_sequence = 0; last_source = UINT32_MAX;
         }
-        display_state.transport_mode = transport_get_mode();
-        const ui_event_t event = ui_poll(&display_state);
-        switch (event.type) {
-        case UI_EVENT_MODE_CHANGED:
-            display_state.selected_mode = event.mode;
-            if (event.mode == MODEM_MODE_BPSK31) {
-                display_state.selected_psk_mode = PSK_MODE_BPSK31;
-            } else if (event.mode == MODEM_MODE_PSK63 && display_state.selected_psk_mode == PSK_MODE_BPSK31) {
-                display_state.selected_psk_mode = PSK_MODE_BPSK63;
-            }
-            if (display_state.rx_tone_hz < modem_mode_band_min_hz(event.mode) ||
-                display_state.rx_tone_hz > modem_mode_band_max_hz(event.mode)) {
-                display_state.rx_tone_hz = (modem_mode_band_min_hz(event.mode) +
-                                           modem_mode_band_max_hz(event.mode)) / 2;
-                ui_event_t tone_event = {
-                    .type = UI_EVENT_TONE_CHANGED,
-                    .tone_hz = display_state.rx_tone_hz,
-                };
-                (void)xQueueSend(s_control_queue, &tone_event, 0);
-            }
-            (void)xQueueSend(s_control_queue, &event, 0);
-            clear_display_spectrum(&spectrum);
-            last_waterfall_sequence = 0U;
-            last_waterfall_source_key = 0xffffffffUL;
-            last_waterfall_sample_rate_hz = 0U;
-            break;
-        case UI_EVENT_PSK_MODE_CHANGED:
-            display_state.selected_psk_mode = event.psk_mode;
-            display_state.selected_mode = event.psk_mode == PSK_MODE_BPSK31 ? MODEM_MODE_BPSK31 : MODEM_MODE_PSK63;
-            (void)xQueueSend(s_control_queue, &event, 0);
-            clear_display_spectrum(&spectrum);
-            last_waterfall_sequence = 0U;
-            last_waterfall_source_key = 0xffffffffUL;
-            last_waterfall_sample_rate_hz = 0U;
-            break;
-        case UI_EVENT_TRANSPORT_CHANGED:
-            display_state.transport_mode = event.transport_mode;
-            (void)xQueueSend(s_control_queue, &event, 0);
-            break;
-        case UI_EVENT_TONE_CHANGED:
-            display_state.rx_tone_hz = event.tone_hz;
-            (void)xQueueSend(s_control_queue, &event, 0);
-            clear_display_spectrum(&spectrum);
-            last_waterfall_sequence = 0U;
-            last_waterfall_source_key = 0xffffffffUL;
-            last_waterfall_sample_rate_hz = 0U;
-            break;
-        case UI_EVENT_TX_MODE_CHANGED: {
-            display_state.selected_tx_psk_mode = event.tx_psk_mode;
-            tx_cmd_t cmd = {
-                .type = TX_CMD_SET_MODE,
-                .mode = event.tx_psk_mode,
-            };
-            send_tx_cmd(&cmd);
-            clear_display_spectrum(&spectrum);
-            last_waterfall_sequence = 0U;
-            last_waterfall_source_key = 0xffffffffUL;
-            last_waterfall_sample_rate_hz = 0U;
-            break;
-        }
-        case UI_EVENT_DISPLAY_ROLE_CHANGED:
-            display_state.display_role = event.display_role != 0;
-            s_display_role = display_state.display_role;
-            if (display_state.display_role) {
-                tx_cmd_t cmd = {
-                    .type = TX_CMD_START_TEXT,
-                    .mode = display_state.selected_tx_psk_mode,
-                    .tone_hz = display_state.tx_tone_hz,
-                };
-                size_t text_len = strnlen(display_state.tx_text, sizeof(cmd.text) - 1);
-                memcpy(cmd.text, display_state.tx_text, text_len);
-                cmd.text[text_len] = '\0';
-                send_tx_cmd(&cmd);
-            } else {
-                tx_cmd_t cmd = {
-                    .type = TX_CMD_STOP,
-                };
-                send_tx_cmd(&cmd);
-            }
-            clear_display_spectrum(&spectrum);
-            last_waterfall_sequence = 0U;
-            last_waterfall_source_key = 0xffffffffUL;
-            last_waterfall_sample_rate_hz = 0U;
-            break;
-        case UI_EVENT_TX_TEXT: {
-            display_state.display_role = 1;
-            s_display_role = 1;
-            display_state.selected_tx_psk_mode = event.tx_psk_mode;
-            display_state.tx_tone_hz = event.tx_tone_hz > 0 ? event.tx_tone_hz : 2000;
-            strncpy(display_state.tx_text, event.tx_text, sizeof(display_state.tx_text) - 1);
-            display_state.tx_text[sizeof(display_state.tx_text) - 1] = '\0';
-            tx_cmd_t cmd = {
-                .type = TX_CMD_START_TEXT,
-                .mode = event.tx_psk_mode,
-                .tone_hz = display_state.tx_tone_hz,
-            };
-            size_t text_len = strnlen(display_state.tx_text, sizeof(cmd.text) - 1);
-            memcpy(cmd.text, display_state.tx_text, text_len);
-            cmd.text[text_len] = '\0';
-            send_tx_cmd(&cmd);
-            clear_display_spectrum(&spectrum);
-            last_waterfall_sequence = 0U;
-            last_waterfall_source_key = 0xffffffffUL;
-            last_waterfall_sample_rate_hz = 0U;
-            break;
-        }
-        case UI_EVENT_OUTPUT_GAIN: {
-            tx_cmd_t cmd = {
-                .type = TX_CMD_SET_OUTPUT_GAIN,
-                .dac_volume = event.output_dac_volume,
-                .hp_volume = event.output_hp_volume,
-            };
-            send_tx_cmd(&cmd);
-            break;
-        }
-        case UI_EVENT_INPUT_GAIN:
-            (void)audio_input_set_gain_db(event.input_gain_db);
-            break;
-        case UI_EVENT_RX_DIAG:
-            (void)xQueueSend(s_control_queue, &event, 0);
-            break;
-        case UI_EVENT_RX_FEC_BRANCH:
-            (void)xQueueSend(s_control_queue, &event, 0);
-            break;
-        case UI_EVENT_TX_STOP: {
-            tx_cmd_t cmd = {
-                .type = TX_CMD_STOP,
-            };
-            send_tx_cmd(&cmd);
-            display_state.tx_active = 0;
-            display_state.tx_queued = 0;
-            clear_display_spectrum(&spectrum);
-            last_waterfall_sequence = 0U;
-            last_waterfall_source_key = 0xffffffffUL;
-            last_waterfall_sample_rate_hz = 0U;
-            break;
-        }
-        case UI_EVENT_NONE:
-        default:
-            break;
-        }
-
-        const int64_t now_us = esp_timer_get_time();
-        if (now_us - last_render_us >= 100000) {
-            last_render_us = now_us;
-            display_state.tx_active = s_tx_active;
-            display_state.tx_queued = s_tx_queued;
-            display_state.input_abs_avg = s_input_abs_avg > 65535 ? 65535U : (uint16_t)s_input_abs_avg;
-            display_state.selected_lane = BOARD_AUDIO_INPUT_CHANNEL == 1 ? 1U : 0U;
-            display_state.update_waterfall = 0;
-            if (xQueueReceive(s_spectrum_queue, &spectrum_msg, 0) == pdTRUE) {
-                if (spectrum_msg.source_key != last_waterfall_source_key ||
-                    spectrum_msg.sample_rate_hz != last_waterfall_sample_rate_hz) {
-                    clear_display_spectrum(&spectrum);
-                    last_waterfall_sequence = 0U;
-                    last_waterfall_source_key = spectrum_msg.source_key;
-                    last_waterfall_sample_rate_hz = spectrum_msg.sample_rate_hz;
-                }
-                if (spectrum_msg.sequence != last_waterfall_sequence) {
-                    spectrum_analyze(spectrum_msg.samples, spectrum_msg.count,
-                                     (int)spectrum_msg.sample_rate_hz, &spectrum);
-                    last_waterfall_sequence = spectrum_msg.sequence;
-                    s_waterfall_peak_hz = spectrum.peak_hz;
-                    display_state.update_waterfall = 1;
+        state.selected_psk_mode = actual.mode;
+        state.selected_mode = actual.mode == PSK_MODE_BPSK31 ? MODEM_MODE_BPSK31 : MODEM_MODE_PSK63;
+        state.selected_tx_psk_mode = actual.tx_mode;
+        state.rx_tone_hz = actual.tone_hz; state.tx_tone_hz = actual.tx_tone_hz;
+        state.display_role = actual.display_role;
+        state.content_type = actual.content_type; state.content_epoch = actual.content_epoch;
+        state.codec_rate = actual.codec_rate; memcpy(state.tx_text, actual.tx_text, sizeof(state.tx_text));
+        state.transport_mode = transport_get_mode();
+        decoded_msg_t msg;
+        while (xQueueReceive(s_decoded_queue, &msg, 0) == pdTRUE) display_append_text(&state, msg.text);
+        const ui_event_t event = ui_poll(&state);
+        if (event.type != UI_EVENT_NONE && xQueueSend(s_control_queue, &event, 0) != pdTRUE)
+            ESP_LOGW(TAG, "Control queue full; retry selection");
+        const int64_t now = esp_timer_get_time();
+        if (now - last_render >= 100000) {
+            last_render = now; state.tx_active = s_tx_active; state.tx_queued = s_tx_queued;
+            state.input_abs_avg = s_input_abs_avg > 65535 ? 65535U : (uint16_t)s_input_abs_avg;
+            state.selected_lane = BOARD_AUDIO_INPUT_CHANNEL; state.update_waterfall = 0;
+            if (xQueueReceive(s_spectrum_queue, &spectrum_msg, 0) == pdTRUE &&
+                (spectrum_msg.source_key == WATERFALL_SOURCE_TX) == (state.display_role != 0)) {
+                if (last_source != spectrum_msg.source_key) { clear_display_spectrum(&spectrum); last_sequence = 0; }
+                last_source = spectrum_msg.source_key;
+                if (spectrum_msg.sequence != last_sequence) {
+                    spectrum_analyze(spectrum_msg.samples, spectrum_msg.count, spectrum_msg.sample_rate_hz, &spectrum);
+                    last_sequence = spectrum_msg.sequence; s_waterfall_peak_hz = spectrum.peak_hz;
+                    state.update_waterfall = 1;
                 }
             }
-            display_render(&display_state, &spectrum);
+            display_render(&state, &spectrum);
         }
         vTaskDelay(pdMS_TO_TICKS(20));
     }
@@ -726,7 +600,8 @@ void app_main(void)
     s_decoded_queue = xQueueCreate(8, sizeof(decoded_msg_t));
     s_control_queue = xQueueCreate(12, sizeof(ui_event_t));
     s_spectrum_queue = xQueueCreate(1, sizeof(spectrum_msg_t));
-    s_tx_queue = xQueueCreate(4, sizeof(tx_cmd_t));
+    s_tx_queue = xQueueCreate(1, sizeof(tx_cmd_t));
+    ESP_ERROR_CHECK(content_service_init());
     ESP_ERROR_CHECK(s_decoded_queue && s_control_queue && s_spectrum_queue && s_tx_queue ?
                     ESP_OK : ESP_ERR_NO_MEM);
 

@@ -25,6 +25,12 @@ int main(void)
     rx_history_append(&h, source, 123);
     assert(rx_history_read(&h, &a, out, sizeof(out), &lost) == 123 && lost == 0);
     assert(memcmp(out, source, 123) == 0);
-    puts("PASS: independent cursors, binary bytes, wrap, overwrite, reboot, empty reads");
+    h.session_start = h.total;
+    b = 0;
+    assert(rx_history_read(&h, &b, out, sizeof(out), &lost) == 0 && b == h.total);
+    rx_history_append(&h, source, 16);
+    assert(rx_history_read(&h, &b, out, sizeof(out), &lost) == 16 && lost == 0);
+    assert(memcmp(out, source, 16) == 0);
+    puts("PASS: independent cursors, binary bytes, wrap, overwrite, reboot, empty reads, content isolation");
     return 0;
 }

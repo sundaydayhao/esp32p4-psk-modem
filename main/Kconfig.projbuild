@@ -10,3 +10,34 @@ menu "PSK receiver hotspot"
         range 1 13
         default 6
 endmenu
+
+menu "AP580 voice module"
+    config PSK_AP580_UART_ENABLED
+        bool "Enable external AP580 on UART1"
+        default n
+        help
+            Enable after assigning the actual wiring. ESP32-P4's ES8311
+            handles PSK audio; speech coding requires the external AP580.
+    config PSK_AP580_TX_GPIO
+        int "P4 UART TX GPIO (to AP580 RX)"
+        range -1 54
+        default -1
+    config PSK_AP580_RX_GPIO
+        int "P4 UART RX GPIO (from AP580 TX)"
+        range -1 54
+        default -1
+    config PSK_AP580_UART_BAUD
+        int "AP580 UART baud rate"
+        range 9600 921600
+        default 115200
+    choice PSK_AP580_RATE
+        prompt "AP580 transmit codec profile (must match physical module)"
+        default PSK_AP580_RATE_600
+        config PSK_AP580_RATE_600
+            bool "600 bit/s"
+        config PSK_AP580_RATE_1200
+            bool "1200 bit/s"
+        config PSK_AP580_RATE_2400
+            bool "2400 bit/s"
+    endchoice
+endmenu

@@ -16,5 +16,9 @@ try {
         if ($LASTEXITCODE) { throw 'History tests failed' }
         & "$outDir/host_rate_check.exe"
         if ($LASTEXITCODE) { throw 'Some rate checks failed; see individual results' }
+        foreach ($offset in @(-20, 20)) {
+            & "$outDir/host_rate_check.exe" 2x8PSK1200F $offset
+            if ($LASTEXITCODE) { throw "Dual 8PSK frequency offset $offset Hz failed" }
+        }
     }
 } finally { Pop-Location }

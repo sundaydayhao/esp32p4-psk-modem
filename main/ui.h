@@ -18,7 +18,10 @@ typedef enum {
     UI_EVENT_RX_DIAG,
     UI_EVENT_RX_FEC_BRANCH,
     UI_EVENT_RX_CONFIG,
-    UI_EVENT_TX_STOP
+    UI_EVENT_TX_STOP,
+    UI_EVENT_CONTENT_CHANGED,
+    UI_EVENT_VOICE_RATE,
+    UI_EVENT_TX_TONE
 } ui_event_type_t;
 
 typedef struct {
@@ -34,6 +37,8 @@ typedef struct {
     int output_hp_volume;
     float input_gain_db;
     int fec_branch_override;
+    int content_type;
+    uint32_t codec_rate;
     char tx_text[256];
 } ui_event_t;
 

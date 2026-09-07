@@ -6,6 +6,8 @@
 
 #ifdef ESP_PLATFORM
 #include "esp_attr.h"
+#include "esp_log.h"
+#include <stdlib.h>
 #endif
 
 #include "PSKTables.h"
@@ -13,6 +15,12 @@
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
+#endif
+
+#if defined(_MSC_VER)
+#define PSK_ALIGN16 __declspec(align(16))
+#else
+#define PSK_ALIGN16 __attribute__((aligned(16)))
 #endif
 
 #define TWO_PI 6.28318530717958647692f
@@ -75,11 +83,16 @@
 #endif
 
 typedef struct {
-    uint8_t (*decisions)[4096];
+    uint8_t *decisions;
+    unsigned decision_stride;
     int16_t *metrics_a;
     int16_t *metrics_b;
     uint16_t *sequence;
     uint8_t *inlv_table;
+    uint16_t inlv_pos;
+    uint32_t syndrome_history[2];
+    uint16_t syndrome_count, syndrome_errors, syndrome_best;
+    uint8_t syndrome_bad_windows;
     uint32_t pair_count;
     uint8_t vit_step;
     uint16_t bit_acc;
@@ -95,21 +108,31 @@ static int s_tables_ready;
 static uint8_t s_vit_out_pair[VIT_MAX_STATES / 2U] PSK_FAST_BSS;
 static uint8_t s_vit_decisions0[VIT_MAX_TRACEBACK][4096] PSK_SDRAM_BSS;
 static uint8_t s_vit_decisions1[VIT_MAX_TRACEBACK][4096] PSK_SDRAM_BSS;
-static int16_t s_vit_metrics0_a[VIT_MAX_STATES] PSK_SDRAM_BSS;
-static int16_t s_vit_metrics0_b[VIT_MAX_STATES] PSK_SDRAM_BSS;
-static int16_t s_vit_metrics1_a[VIT_MAX_STATES] PSK_SDRAM_BSS;
-static int16_t s_vit_metrics1_b[VIT_MAX_STATES] PSK_SDRAM_BSS;
-/* K<=7 is the high-rate path. Keep its 512-byte working set in internal RAM;
- * reserve PSRAM for K13/K16 instead of occupying 256 KiB of internal heap. */
-static int16_t s_vit_small[2][2][64];
+PSK_ALIGN16 static int16_t s_vit_metrics0_a[VIT_MAX_STATES] PSK_FAST_BSS;
+PSK_ALIGN16 static int16_t s_vit_metrics0_b[VIT_MAX_STATES] PSK_FAST_BSS;
+PSK_ALIGN16 static int16_t s_vit_metrics1_a[VIT_MAX_STATES] PSK_FAST_BSS;
+/* Two live vectors plus one shared destination: 192 KiB instead of 256 KiB.
+ * FEC branches run serially on the audio task, so their destination is reusable. */
+static int16_t *s_vit_large_scratch = s_vit_metrics0_b;
+/* Keep both K<=7 and K13/K16 live metrics in internal RAM. The shared
+ * large destination limits the full-trellis working set to 192 KiB. */
+PSK_ALIGN16 static int16_t s_vit_small[2][2][64];
+static uint8_t s_vit_small_decisions[2][VIT_MAX_TRACEBACK][8];
+static uint8_t s_vit_groups[VIT_MAX_STATES / 8U];
+static uint8_t s_vit_group_xor[8];
+#if defined(ESP_PLATFORM) && CONFIG_IDF_TARGET_ESP32P4
+extern void psk_viterbi_p4_acs(const int16_t *, const int16_t *, int16_t *, uint8_t *,
+                             const uint8_t *, const int16_t *, unsigned, const int16_t *);
+PSK_ALIGN16 static const int16_t s_vit_weights[8] = {1,2,4,8,16,32,64,128};
+#endif
 static uint16_t s_vit_sequence0[256];
 static uint16_t s_vit_sequence1[256];
 static uint8_t s_inlv_table0[2560];
 static uint8_t s_inlv_table1[2560];
 static fec_branch_state_t s_fec_branch[2] = {
-    {.decisions = s_vit_decisions0, .metrics_a = s_vit_metrics0_a, .metrics_b = s_vit_metrics0_b,
+    {.decisions = &s_vit_decisions0[0][0], .decision_stride = 4096, .metrics_a = s_vit_metrics0_a, .metrics_b = s_vit_metrics0_b,
      .sequence = s_vit_sequence0, .inlv_table = s_inlv_table0, .bit_acc = 1U},
-    {.decisions = s_vit_decisions1, .metrics_a = s_vit_metrics1_a, .metrics_b = s_vit_metrics1_b,
+    {.decisions = &s_vit_decisions1[0][0], .decision_stride = 4096, .metrics_a = s_vit_metrics1_a, .metrics_b = NULL,
      .sequence = s_vit_sequence1, .inlv_table = s_inlv_table1, .bit_acc = 1U},
 };
 static uint8_t s_vit_table_k;
@@ -151,10 +174,8 @@ static const unsigned char s_rtty_table[0x20][2] = {
     {'O', '9'}, {'B', '?'}, {'G', '&'}, {0, 0}, {'M', '.'}, {'X', '/'}, {0, 0}, {0, 0},
 };
 
-static const uint8_t s_gray_8psk_softbits[8][3] = {
-    {25, 0, 25}, {0, 25, 230}, {0, 230, 230}, {25, 255, 25},
-    {230, 255, 25}, {255, 230, 230}, {255, 25, 230}, {230, 0, 25},
-};
+/* Labels in receive bit order (MSB first), inverse of the FEC 8PSK map. */
+static const uint8_t s_gray_8psk_soft_labels[8] = {0, 4, 6, 2, 3, 7, 5, 1};
 
 static const unsigned short s_mfsk_varidecode[256] = {
     0x75C,0x760,0x768,0x76C,0x770,0x774,0x778,0x77C,0x0A8,0x780,0x7A0,0x7A8,0x7AC,0x0AC,0x7B0,0x7B4,
@@ -410,6 +431,7 @@ static void reset_runtime(psk_rtty_rx_t *rx)
     rx->q_freq_error = 0.0f;
     rx->nlp_k = PSKCORE_NLP_K;
     rx->agc_ave = 0.0f;
+    memset(rx->chan_prev_bit_signal, 0, sizeof(rx->chan_prev_bit_signal));
     rx->dev_ave = 90.0f;
     rx->bpsk_average_amp = 0.0f;
     rx->psk8_last_phase_quality = 0.0f;
@@ -763,8 +785,70 @@ static void push_mfsk_varicode_bit_branch(psk_rtty_rx_t *rx, fec_branch_state_t 
     }
 }
 
+static uint8_t binary_sync_distance(uint32_t value, uint32_t target)
+{
+    uint32_t different = value ^ target;
+    uint8_t count = 0U;
+    while (different != 0U) {
+        different &= different - 1U;
+        ++count;
+    }
+    return count;
+}
+
+static void push_binary_bit(psk_rtty_rx_t *rx, int bit)
+{
+    if (rx->binary_sync_word != 0U && !rx->binary_synced) {
+        rx->binary_sync_shift = (rx->binary_sync_shift << 1U) | (bit ? 1U : 0U);
+        if (rx->binary_sync_bit_count < 32U) {
+            ++rx->binary_sync_bit_count;
+        }
+        if (rx->binary_sync_bit_count >= 32U &&
+            binary_sync_distance(rx->binary_sync_shift, rx->binary_sync_word) == 0U) {
+            rx->binary_synced = 1U;
+            rx->binary_sync_bit_count = 0U;
+            rx->binary_bit_count = 0U;
+            rx->bit_acc = 0U;
+            if (rx->config.char_cb) {
+                rx->config.char_cb((char)(rx->binary_sync_word >> 24U), rx->config.userdata);
+                rx->config.char_cb((char)(rx->binary_sync_word >> 16U), rx->config.userdata);
+                rx->config.char_cb((char)(rx->binary_sync_word >> 8U), rx->config.userdata);
+                rx->config.char_cb((char)rx->binary_sync_word, rx->config.userdata);
+            }
+            return;
+        }
+        return;
+    }
+
+    rx->bit_acc = (uint16_t)(((rx->bit_acc << 1U) | (bit ? 1U : 0U)) & 0xFFU);
+    rx->binary_bit_count++;
+    if (rx->binary_bit_count >= 8U) {
+        rx->binary_bit_count = 0U;
+        if (rx->config.char_cb) {
+            rx->config.char_cb((char)(rx->bit_acc & 0xFFU), rx->config.userdata);
+        }
+    }
+}
+
+static void push_binary_bit_branch(psk_rtty_rx_t *rx, fec_branch_state_t *branch,
+                                   uint8_t branch_index, int bit)
+{
+    /* The unselected decoder must not reset the selected stream's byte state. */
+    if (!fec_branch_can_emit(rx, branch_index)) return;
+    if (branch->pair_count <= fec_ready_pairs_required(rx) || !rx_signal_ready(rx)) {
+        rx->binary_synced = 0U;
+        rx->binary_bit_count = 0U;
+        rx->binary_sync_bit_count = 0U;
+        rx->binary_sync_shift = 0U;
+        rx->bit_acc = 0U;
+        return;
+    }
+    push_binary_bit(rx, bit);
+}
+
 static void push_payload_bit(psk_rtty_rx_t *rx, int bit)
 {
+    if (rx->binary_mode) { push_binary_bit(rx, bit); return; }
     if (rx->use_mfsk_varicode) {
         push_mfsk_varicode_bit(rx, bit);
     } else {
@@ -786,11 +870,21 @@ static void reset_fec_branch(psk_rtty_rx_t *rx, uint8_t branch_index)
     const uint16_t nstates = rx->fec_k ? (uint16_t)(1UL << (rx->fec_k - 1U)) : 0U;
     fec_branch_state_t *state = &s_fec_branch[branch_index];
 
-    state->metrics_a = nstates <= 64 ? s_vit_small[branch_index][0] :
-        (branch_index ? s_vit_metrics1_a : s_vit_metrics0_a);
-    state->metrics_b = nstates <= 64 ? s_vit_small[branch_index][1] :
-        (branch_index ? s_vit_metrics1_b : s_vit_metrics0_b);
+    if (nstates <= 64) {
+        state->metrics_a = s_vit_small[branch_index][0];
+        state->metrics_b = s_vit_small[branch_index][1];
+    }
 
+    /* Compact K<=7 survivors avoid a 4096-byte stride through PSRAM for every
+     * traceback bit (severe cache set conflicts at the high symbol rates). */
+    state->decisions = nstates <= 64 ? &s_vit_small_decisions[branch_index][0][0] :
+        (branch_index ? &s_vit_decisions1[0][0] : &s_vit_decisions0[0][0]);
+    state->decision_stride = nstates <= 64 ? 8 : 4096;
+    state->inlv_pos = 0;
+    state->syndrome_history[0] = state->syndrome_history[1] = 0;
+    state->syndrome_count = state->syndrome_errors = 0;
+    state->syndrome_best = 256;
+    state->syndrome_bad_windows = 0;
     state->pair_count = 0;
     state->vit_step = 0;
     state->bit_acc = 1U;
@@ -799,13 +893,16 @@ static void reset_fec_branch(psk_rtty_rx_t *rx, uint8_t branch_index)
     memset(state->inlv_table, FEC_PUNCTURE, sizeof(s_inlv_table0));
     if (nstates != 0U) {
         memset(state->metrics_a, 0, (size_t)nstates * sizeof(state->metrics_a[0]));
-        memset(state->metrics_b, 0, (size_t)nstates * sizeof(state->metrics_b[0]));
+        if (nstates <= 64) memset(state->metrics_b, 0, (size_t)nstates * sizeof(state->metrics_b[0]));
     }
 }
 
 static void reset_fec_branches(psk_rtty_rx_t *rx)
 {
     const uint8_t branch_count = rx->fec_dual_branch ? 2U : 1U;
+    s_fec_branch[0].metrics_a = s_vit_metrics0_a;
+    s_fec_branch[1].metrics_a = s_vit_metrics1_a;
+    s_vit_large_scratch = s_vit_metrics0_b;
 
     for (uint8_t branch = 0; branch < branch_count; ++branch) {
         reset_fec_branch(rx, branch);
@@ -932,7 +1029,9 @@ static void push_payload_bits_from_fec(psk_rtty_rx_t *rx, fec_branch_state_t *br
 {
     for (int bit = (int)rx->vit_chunksize - 1; bit >= 0; --bit) {
         const int payload_bit = (decoded >> bit) & 1U;
-        if (rx->fec_dual_branch && rx->use_mfsk_varicode) {
+        if (rx->fec_dual_branch && rx->binary_mode) {
+            push_binary_bit_branch(rx, branch, branch_index, payload_bit);
+        } else if (rx->fec_dual_branch && rx->use_mfsk_varicode) {
             push_mfsk_varicode_bit_branch(rx, branch, branch_index, payload_bit);
         } else {
             push_payload_bit(rx, payload_bit);
@@ -992,15 +1091,14 @@ static void fec_deinterleave_pair(psk_rtty_rx_t *rx, fec_branch_state_t *state, 
         return;
     }
 
-    for (uint16_t k = 0; k < rx->inlv_depth; ++k) {
-        const uint16_t base = (uint16_t)(k * 4U);
-        state->inlv_table[base + 0U] = state->inlv_table[base + 1U];
-        state->inlv_table[base + 1U] = pair[0];
-        state->inlv_table[base + 2U] = state->inlv_table[base + 3U];
-        state->inlv_table[base + 3U] = pair[1];
-        pair[0] = state->inlv_table[base + 0U];
-        pair[1] = state->inlv_table[base + 3U];
-    }
+    /* The two-lane cascade delays lane 0 by exactly depth pairs while lane 1
+     * passes through. A circular delay is bit-exact and costs O(1), avoiding
+     * hundreds of shift stages for every Viterbi input pair. */
+    const uint8_t delayed = state->inlv_table[state->inlv_pos];
+    state->inlv_table[state->inlv_pos] = pair[0];
+    pair[0] = delayed;
+    if (++state->inlv_pos == rx->inlv_depth) state->inlv_pos = 0;
+
 }
 
 static PSK_FAST_TEXT int branch_metric(uint8_t expected, uint8_t b0, uint8_t b1)
@@ -1016,6 +1114,48 @@ static PSK_FAST_TEXT int branch_metric(uint8_t expected, uint8_t b0, uint8_t b1)
     }
     return metric;
 }
+
+#if defined(ESP_PLATFORM) && CONFIG_IDF_TARGET_ESP32P4
+/* Test the actual PIE instructions against independent scalar ACS on each new
+ * polynomial. Includes all parity classes, neutral/strong soft bits and ties.
+ * Scratch is separate from the live decoder so reacquisition remains safe. */
+static void vit_pie_selftest(const psk_rtty_rx_t *rx)
+{
+    if (s_vit_input_flip != 3 || !(rx->fec_poly1 & rx->fec_poly2 & 1)) return;
+    PSK_ALIGN16 int16_t prev[64];
+    PSK_ALIGN16 int16_t curr[64];
+    PSK_ALIGN16 int16_t vectors[4][8];
+    uint8_t groups[8], decisions[8];
+    uint32_t random = 0x1571adca;
+    for (unsigned trial = 0; trial < 256; ++trial) {
+        int16_t mt[4];
+        const uint8_t b0 = trial, b1 = (uint8_t)(trial * 73);
+        for (unsigned c = 0; c < 4; ++c) {
+            mt[c] = branch_metric(c, b0, b1);
+        }
+        for (unsigned c = 0; c < 4; ++c)
+            for (unsigned lane = 0; lane < 8; ++lane)
+                vectors[c][lane] = mt[c ^ s_vit_group_xor[lane]];
+        for (unsigned i = 0; i < 64; ++i) {
+            random ^= random << 13; random ^= random >> 17; random ^= random << 5;
+            prev[i] = trial < 4 ? 0 : (int16_t)((int)(random % 16001) - 8000);
+        }
+        for (unsigned g = 0; g < 8; ++g) groups[g] = (trial + g) & 3;
+        psk_viterbi_p4_acs(prev, prev+32, curr, decisions, groups, &vectors[0][0], 4, s_vit_weights);
+        for (unsigned state = 0; state < 64; ++state) {
+            const unsigned out = groups[state/8] ^ s_vit_group_xor[state%8];
+            const int p0 = prev[state/2] + mt[out], p1 = prev[state/2+32] - mt[out];
+            if (curr[state] != (p0 > p1 ? p0 : p1) ||
+                ((decisions[state/8] >> (state%8)) & 1) != (p1 >= p0)) {
+                ESP_LOGE("viterbi", "PIE self-test failed trial=%u state=%u got=%d want=%d decision=%u",
+                         trial, state, curr[state], p0 > p1 ? p0 : p1, decisions[state/8]);
+                abort();
+            }
+        }
+    }
+    ESP_LOGI("viterbi", "PIE ACS self-test passed: K=%u, 16384 states / decisions", rx->fec_k);
+}
+#endif
 
 static PSK_FAST_TEXT void prepare_viterbi_tables(const psk_rtty_rx_t *rx, uint16_t nstates)
 {
@@ -1037,6 +1177,15 @@ static PSK_FAST_TEXT void prepare_viterbi_tables(const psk_rtty_rx_t *rx, uint16
     s_vit_input_flip = (uint8_t)(((rx->fec_poly1 & nstates) ? 1U : 0U) |
                                  ((rx->fec_poly2 & nstates) ? 2U : 0U));
 
+    for (unsigned state = 0; state < nstates; state += 8)
+        s_vit_groups[state/8] = s_vit_out_pair[state/2] & 3U;
+    for (unsigned lane = 0; lane < 8; ++lane)
+        s_vit_group_xor[lane] = (uint8_t)(parity32(lane & rx->fec_poly1) |
+                                           (parity32(lane & rx->fec_poly2) << 1U));
+
+#if defined(ESP_PLATFORM) && CONFIG_IDF_TARGET_ESP32P4
+    vit_pie_selftest(rx);
+#endif
     s_vit_table_k = rx->fec_k;
     s_vit_table_poly1 = rx->fec_poly1;
     s_vit_table_poly2 = rx->fec_poly2;
@@ -1044,21 +1193,12 @@ static PSK_FAST_TEXT void prepare_viterbi_tables(const psk_rtty_rx_t *rx, uint16
 
 static PSK_FAST_TEXT int vit_get_decision(const fec_branch_state_t *branch, uint8_t step, uint16_t state)
 {
-    return (branch->decisions[step][state >> 3U] >> (state & 7U)) & 1U;
+    return (branch->decisions[(unsigned)step * branch->decision_stride + (state >> 3U)] >> (state & 7U)) & 1U;
 }
 
 static PSK_FAST_TEXT uint8_t vit_traceback(psk_rtty_rx_t *rx, fec_branch_state_t *branch,
-                                           uint16_t nstates, const int16_t *metrics, int *metric)
+                                           uint16_t nstates, uint16_t state, int *metric)
 {
-    int16_t best_metric = metrics[0];
-    uint16_t state = 0;
-    for (uint16_t i = 1; i < nstates; ++i) {
-        if (metrics[i] > best_metric) {
-            best_metric = metrics[i];
-            state = i;
-        }
-    }
-
     uint8_t step = (uint8_t)((branch->vit_step + VIT_MAX_TRACEBACK - 1U) % VIT_MAX_TRACEBACK);
     branch->sequence[rx->vit_traceback] = state;
     for (int i = (int)rx->vit_traceback - 1; i >= 0; --i) {
@@ -1091,173 +1231,78 @@ static PSK_FAST_TEXT uint8_t vit_traceback(psk_rtty_rx_t *rx, fec_branch_state_t
     return out;
 }
 
+/* One ACS update. The table is only 64 bytes: the lower three state bits
+ * determine the within-vector pattern, while each group XORs one of four
+ * parity classes. The upper predecessor complements both encoded bits. */
+static PSK_FAST_TEXT void vit_acs(const psk_rtty_rx_t *rx, unsigned nstates,
+                                const int16_t *prev, int16_t *curr, uint8_t *decisions,
+                                const int16_t metric_table[4])
+{
+#if defined(ESP_PLATFORM) && CONFIG_IDF_TARGET_ESP32P4
+    if (s_vit_input_flip == 3U && (rx->fec_poly1 & rx->fec_poly2 & 1U)) {
+        PSK_ALIGN16 int16_t vectors[4][8];
+        for (unsigned c = 0; c < 4; ++c)
+            for (unsigned lane = 0; lane < 8; ++lane)
+                vectors[c][lane] = metric_table[c ^ s_vit_group_xor[lane]];
+        psk_viterbi_p4_acs(prev, prev + nstates/2, curr, decisions,
+                          s_vit_groups, &vectors[0][0], nstates/16, s_vit_weights);
+        return;
+    }
+#else
+    (void)rx;
+#endif
+    for (unsigned base = 0; base < nstates; base += 8) {
+        unsigned decision = 0;
+        for (unsigned lane = 0; lane < 8; ++lane) {
+            const unsigned state = base + lane, pred = state >> 1;
+            const unsigned packed = s_vit_out_pair[pred];
+            const unsigned out = (state & 1) ? packed >> 2 : packed & 3;
+            const int path0 = prev[pred] + metric_table[out];
+            const int path1 = prev[pred + nstates/2] + metric_table[out ^ s_vit_input_flip];
+            const int take1 = path1 >= path0;
+            curr[state] = (int16_t)(take1 ? path1 : path0);
+            decision |= (unsigned)take1 << lane;
+        }
+        decisions[base >> 3] = (uint8_t)decision;
+    }
+}
+
 static PSK_FAST_TEXT int fec_decode_pair(psk_rtty_rx_t *rx, fec_branch_state_t *branch,
                                          uint8_t b0, uint8_t b1, uint8_t *decoded, int *metric)
 {
-    if (!rx->fec_k || rx->fec_k > 16U) {
-        return 0;
-    }
-
+    if (!rx->fec_k || rx->fec_k > 16U) return 0;
     const uint16_t nstates = (uint16_t)(1UL << (rx->fec_k - 1U));
-    int16_t *prev = (branch->vit_step & 1U) ? branch->metrics_b : branch->metrics_a;
-    int16_t *curr = (branch->vit_step & 1U) ? branch->metrics_a : branch->metrics_b;
-    int16_t max_metric = -32768;
+    int16_t *prev = branch->metrics_a;
+    int16_t *curr = nstates <= 64 ? branch->metrics_b : s_vit_large_scratch;
     int16_t metric_table[4];
-
     prepare_viterbi_tables(rx, nstates);
-    for (uint8_t expected = 0; expected < 4U; ++expected) {
+    for (uint8_t expected = 0; expected < 4U; ++expected)
         metric_table[expected] = (int16_t)branch_metric(expected, b0, b1);
-    }
-    int16_t metric_even0[16];
-    int16_t metric_even1[16];
-    int16_t metric_odd0[16];
-    int16_t metric_odd1[16];
-    const uint8_t input_flip = s_vit_input_flip;
-    for (uint8_t packed = 0; packed < 16U; ++packed) {
-        const uint8_t out_even = packed & 3U;
-        const uint8_t out_odd = packed >> 2U;
-        metric_even0[packed] = metric_table[out_even];
-        metric_even1[packed] = metric_table[out_even ^ input_flip];
-        metric_odd0[packed] = metric_table[out_odd];
-        metric_odd1[packed] = metric_table[out_odd ^ input_flip];
-    }
     branch->rx_pair0[branch->vit_step] = b0;
     branch->rx_pair1[branch->vit_step] = b1;
-    uint8_t *decision_row = branch->decisions[branch->vit_step];
-    const uint16_t predecessor_half = (uint16_t)(nstates >> 1U);
-    for (uint16_t pred_base = 0, state_base = 0; pred_base < predecessor_half;
-         pred_base = (uint16_t)(pred_base + 4U), state_base = (uint16_t)(state_base + 8U)) {
-        uint8_t decision_byte = 0;
-        uint16_t pred = pred_base;
-        uint16_t state_even = state_base;
-        uint16_t state_odd = (uint16_t)(state_even + 1U);
-        int16_t path0 = prev[pred];
-        int16_t path1 = prev[pred + predecessor_half];
-        uint8_t packed = s_vit_out_pair[pred];
-        int16_t even0 = (int16_t)(path0 + metric_even0[packed]);
-        int16_t even1 = (int16_t)(path1 + metric_even1[packed]);
-        if (even0 > even1) {
-            curr[state_even] = even0;
-        } else {
-            curr[state_even] = even1;
-            decision_byte |= 0x01U;
-        }
-        int16_t odd0 = (int16_t)(path0 + metric_odd0[packed]);
-        int16_t odd1 = (int16_t)(path1 + metric_odd1[packed]);
-        if (odd0 > odd1) {
-            curr[state_odd] = odd0;
-        } else {
-            curr[state_odd] = odd1;
-            decision_byte |= 0x02U;
-        }
-        if (curr[state_even] > max_metric) {
-            max_metric = curr[state_even];
-        }
-        if (curr[state_odd] > max_metric) {
-            max_metric = curr[state_odd];
-        }
-
-        pred = (uint16_t)(pred_base + 1U);
-        state_even = (uint16_t)(state_base + 2U);
-        state_odd = (uint16_t)(state_even + 1U);
-        path0 = prev[pred];
-        path1 = prev[pred + predecessor_half];
-        packed = s_vit_out_pair[pred];
-        even0 = (int16_t)(path0 + metric_even0[packed]);
-        even1 = (int16_t)(path1 + metric_even1[packed]);
-        if (even0 > even1) {
-            curr[state_even] = even0;
-        } else {
-            curr[state_even] = even1;
-            decision_byte |= 0x04U;
-        }
-        odd0 = (int16_t)(path0 + metric_odd0[packed]);
-        odd1 = (int16_t)(path1 + metric_odd1[packed]);
-        if (odd0 > odd1) {
-            curr[state_odd] = odd0;
-        } else {
-            curr[state_odd] = odd1;
-            decision_byte |= 0x08U;
-        }
-        if (curr[state_even] > max_metric) {
-            max_metric = curr[state_even];
-        }
-        if (curr[state_odd] > max_metric) {
-            max_metric = curr[state_odd];
-        }
-
-        pred = (uint16_t)(pred_base + 2U);
-        state_even = (uint16_t)(state_base + 4U);
-        state_odd = (uint16_t)(state_even + 1U);
-        path0 = prev[pred];
-        path1 = prev[pred + predecessor_half];
-        packed = s_vit_out_pair[pred];
-        even0 = (int16_t)(path0 + metric_even0[packed]);
-        even1 = (int16_t)(path1 + metric_even1[packed]);
-        if (even0 > even1) {
-            curr[state_even] = even0;
-        } else {
-            curr[state_even] = even1;
-            decision_byte |= 0x10U;
-        }
-        odd0 = (int16_t)(path0 + metric_odd0[packed]);
-        odd1 = (int16_t)(path1 + metric_odd1[packed]);
-        if (odd0 > odd1) {
-            curr[state_odd] = odd0;
-        } else {
-            curr[state_odd] = odd1;
-            decision_byte |= 0x20U;
-        }
-        if (curr[state_even] > max_metric) {
-            max_metric = curr[state_even];
-        }
-        if (curr[state_odd] > max_metric) {
-            max_metric = curr[state_odd];
-        }
-
-        pred = (uint16_t)(pred_base + 3U);
-        state_even = (uint16_t)(state_base + 6U);
-        state_odd = (uint16_t)(state_even + 1U);
-        path0 = prev[pred];
-        path1 = prev[pred + predecessor_half];
-        packed = s_vit_out_pair[pred];
-        even0 = (int16_t)(path0 + metric_even0[packed]);
-        even1 = (int16_t)(path1 + metric_even1[packed]);
-        if (even0 > even1) {
-            curr[state_even] = even0;
-        } else {
-            curr[state_even] = even1;
-            decision_byte |= 0x40U;
-        }
-        odd0 = (int16_t)(path0 + metric_odd0[packed]);
-        odd1 = (int16_t)(path1 + metric_odd1[packed]);
-        if (odd0 > odd1) {
-            curr[state_odd] = odd0;
-        } else {
-            curr[state_odd] = odd1;
-            decision_byte |= 0x80U;
-        }
-        if (curr[state_even] > max_metric) {
-            max_metric = curr[state_even];
-        }
-        if (curr[state_odd] > max_metric) {
-            max_metric = curr[state_odd];
-        }
-        decision_row[state_base >> 3U] = decision_byte;
-    }
-
-    if (max_metric > 12000) {
-        for (uint16_t i = 0; i < nstates; ++i) {
-            curr[i] = (int16_t)(curr[i] - max_metric);
-        }
-    }
-
+    vit_acs(rx, nstates, prev, curr, branch->decisions + (unsigned)branch->vit_step * branch->decision_stride, metric_table);
+    branch->metrics_a = curr;
+    if (nstates <= 64) branch->metrics_b = prev;
+    else s_vit_large_scratch = prev;
     branch->vit_step = (uint8_t)((branch->vit_step + 1U) % VIT_MAX_TRACEBACK);
     branch->pair_count++;
-    if ((branch->pair_count % rx->vit_chunksize) == 0U &&
-        branch->pair_count > rx->vit_traceback) {
-        *decoded = vit_traceback(rx, branch, nstates, curr, metric);
-        return 1;
+
+    /* Scan once per output chunk, including acquisition. The maximum can grow
+     * by at most 4*256 between scans, safely below int16 saturation. Subtracting
+     * a common offset preserves every survivor and its tie-breaking decision. */
+    if ((branch->pair_count % rx->vit_chunksize) == 0U) {
+        int16_t best = curr[0];
+        uint16_t best_state = 0;
+        for (uint16_t i = 1; i < nstates; ++i) {
+            if (curr[i] > best) { best = curr[i]; best_state = i; }
+        }
+        if (best > 12000) {
+            for (uint16_t i = 0; i < nstates; ++i) curr[i] = (int16_t)(curr[i] - best);
+        }
+        if (branch->pair_count > rx->vit_traceback) {
+            *decoded = vit_traceback(rx, branch, nstates, best_state, metric);
+            return 1;
+        }
     }
     return 0;
 }
@@ -1277,6 +1322,33 @@ static void decode_fec_pair_for_branch(psk_rtty_rx_t *rx, uint8_t branch_index, 
         pair[1] = tmp;
     }
 
+    /* A stopped alternate Viterbi branch has a stale metric. Detect a bit-pair
+     * phase slip using the convolutional parity identity g2*y1 XOR g1*y2 = 0,
+     * rather than allowing a wrong branch to remain locked indefinitely.
+     * Ignore interleaver/trellis startup; require two very poor 256-pair windows.
+     * Explicit FECBRANCH overrides remain under diagnostic/user control. */
+    if (fec_is_k16_8psk(rx) && rx->fec_forced_branch >= 2U) {
+        branch->syndrome_history[0] = (branch->syndrome_history[0] << 1) | (pair[0] >= 128);
+        branch->syndrome_history[1] = (branch->syndrome_history[1] << 1) | (pair[1] >= 128);
+        if (rx->fec_locked_branch == branch_index &&
+            branch->pair_count > (uint32_t)rx->inlv_depth + rx->vit_traceback) {
+            branch->syndrome_errors += parity32(branch->syndrome_history[0] & rx->fec_poly2) ^
+                                       parity32(branch->syndrome_history[1] & rx->fec_poly1);
+            if (++branch->syndrome_count == 256) {
+                if (branch->syndrome_errors < branch->syndrome_best)
+                    branch->syndrome_best = branch->syndrome_errors;
+                const int bad = branch->syndrome_errors > 112 ||
+                    (branch->syndrome_best <= 32 && branch->syndrome_errors > 80);
+                branch->syndrome_bad_windows = bad ? branch->syndrome_bad_windows + 1 : 0;
+                branch->syndrome_count = branch->syndrome_errors = 0;
+                if (branch->syndrome_bad_windows >= 2) {
+                    ++rx->debug_fec_reacquires;
+                    reset_fec_acquisition(rx);
+                    return;
+                }
+            }
+        }
+    }
     uint8_t decoded = 0;
     int metric = 0;
     if (fec_decode_pair(rx, branch, pair[0], pair[1], &decoded, &metric)) {
@@ -1394,7 +1466,7 @@ static void finish_symbol(psk_rtty_rx_t *rx)
         push_rtty_bit(rx, rx->i_acc > 0.0f ? 1 : 0);
     } else {
         const int bit = fabsf(diff) > ((float)M_PI * 0.5f) ? 0 : 1;
-        push_varicode_bit(rx, bit);
+        if (rx->binary_mode) { push_binary_bit(rx, bit); } else { push_varicode_bit(rx, bit); }
     }
 
     rx->i_acc = 0.0f;
@@ -1450,6 +1522,7 @@ static PSK_FAST_TEXT void calc_bit_filter(psk_rtty_rx_t *rx, uint8_t car, psk_rt
     const int sinc_1200f = rx->config.mode == PSK_RTTY_MODE_8PSK1200F ||
                            rx->config.mode == PSK_RTTY_MODE_2X8PSK1200F;
     const float *bit_fir = sinc_1200f ? s_bit_fir_1_over_13 : (rx->bit_fir ? rx->bit_fir : s_bit_fir);
+    rx->chan_prev_bit_signal[car] = rx->chan_bit_signal[car];
     rx->chan_bit_queue[car][rx->chan_bit_fir_state[car]] = sample;
     rx->chan_bit_signal[car] = fir_complex(rx->chan_bit_queue[car], rx->chan_bit_fir_state[car],
                                             PSKCORE_BITFIR_LENGTH, bit_fir);
@@ -1566,7 +1639,11 @@ static PSK_FAST_TEXT int symbol_sync_fractional(psk_rtty_rx_t *rx, float energy)
 
     /* fldigi aligns its fractional bit clock by comparing the two halves of
      * the matched-filter magnitude waveform. */
-    rx->sync_ave[index] = 0.8f * rx->sync_ave[index] + 0.2f * energy;
+    /* The dual-carrier envelope depends strongly on the data. Average about
+     * 20 symbols (16 ms) so pattern energy does not steer the sampling clock;
+     * the single-carrier modes retain their faster acquisition response. */
+    const float alpha = rx->config.mode == PSK_RTTY_MODE_2X8PSK1200F ? 0.05f : 0.2f;
+    rx->sync_ave[index] = (1.0f - alpha) * rx->sync_ave[index] + alpha * energy;
     float difference = 0.0f;
     float amplitude = 0.0f;
     const int half = timing_bins / 2;
@@ -1611,7 +1688,7 @@ static PSK_FAST_TEXT int symbol_sync_fractional(psk_rtty_rx_t *rx, float energy)
 
 static PSK_FAST_TEXT int symbol_sync(psk_rtty_rx_t *rx, float energy)
 {
-    if (rx->config.mode == PSK_RTTY_MODE_8PSK1200F || rx->config.mode == PSK_RTTY_MODE_2X8PSK1200F)
+    if (rx->config.mode == PSK_RTTY_MODE_8PSK1200F || rx->config.mode == PSK_RTTY_MODE_2X8PSK1200F || fec_is_k16_8psk(rx))
         return symbol_sync_fractional(rx, energy);
     int trigger = 0;
     int bit_pos = rx->bit_pos;
@@ -1809,45 +1886,26 @@ static uint8_t bpsk_soft_bit(psk_rtty_rx_t *rx, float angle, float signal_amp)
     return (uint8_t)(soft + 0.5f);
 }
 
+/* Max-log angular soft decision. Near a bit boundary the two distances
+ * converge, producing an erasure near 128 instead of a confidently wrong bit.
+ * Each carrier is scored independently; do not average its phase quality with
+ * the previously visited carrier or reduce all three bit reliabilities alike. */
 static void push_8psk_soft_bits(psk_rtty_rx_t *rx, float angle)
 {
-    const float demap_angle = angle;
-    const uint8_t bitindex = phase_index(demap_angle, 8U);
-    float phase_quality = fabsf(cosf(4.0f * demap_angle));
-    int soft_quality_error;
-
-    phase_quality = (phase_quality + rx->psk8_last_phase_quality) * 0.5f;
-    rx->psk8_last_phase_quality = phase_quality;
-
-    soft_quality_error = (int)(128.0f - (128.0f * phase_quality));
-    if (soft_quality_error > (255 - 25) ||
-        soft_quality_error > (128 - (128 / 8))) {
-        for (uint8_t bit = 0U; bit < 3U; ++bit) {
-            rx->debug_soft_ambiguous++;
-            push_fec_encoded_bit(rx, FEC_PUNCTURE);
+    const float step = TWO_PI/8.0f;
+    for (int bit=2; bit>=0; --bit) {
+        float best0=TWO_PI, best1=TWO_PI;
+        for(unsigned phase=0; phase<8; ++phase) {
+            float d=fabsf(angle-step*phase);
+            if(d>M_PI)d=TWO_PI-d;
+            if(((s_gray_8psk_soft_labels[phase] >> bit) & 1U) == 0U) {if(d<best0)best0=d;}
+            else {if(d<best1)best1=d;}
         }
-        return;
-    }
-    if (soft_quality_error < (128 / 3)) {
-        soft_quality_error = 0;
-    } else {
-        soft_quality_error /= 2;
-    }
-
-    for (int bit = 2; bit >= 0; --bit) {
-        const uint8_t base = s_gray_8psk_softbits[bitindex][bit];
-        int soft = base > 128U ? (int)base - soft_quality_error :
-                                  (int)base + soft_quality_error;
-        if (soft < 0) {
-            soft = 0;
-        } else if (soft > 255) {
-            soft = 255;
-        }
-        const int distance = (int)soft - 128;
-        if (distance > -8 && distance < 8) {
-            rx->debug_soft_ambiguous++;
-        }
-        push_fec_encoded_bit(rx, (uint8_t)soft);
+        float v=128.0f + 127.0f*(best0-best1)/step;
+        if (v < 0.0f) v = 0.0f;
+        if (v > 255.0f) v = 255.0f;
+        if (v >= 112.0f && v <= 144.0f) ++rx->debug_soft_ambiguous;
+        push_fec_encoded_bit(rx,(uint8_t)(v+0.5f));
     }
 }
 
@@ -1869,7 +1927,7 @@ static void process_raw_symbol(psk_rtty_rx_t *rx, uint8_t symbol, uint8_t phase_
         const int bit = symbol == 2U;
         rx->debug_bits++;
         bit ? rx->debug_ones++ : rx->debug_zeros++;
-        push_varicode_bit(rx, bit);
+        if (rx->binary_mode) { push_binary_bit(rx, bit); } else { push_varicode_bit(rx, bit); }
         return;
     }
 
@@ -1900,9 +1958,9 @@ static void process_raw_symbol(psk_rtty_rx_t *rx, uint8_t symbol, uint8_t phase_
     rx->debug_ones += b0 + b1 + b2;
     rx->debug_zeros += 3U - b0 - b1 - b2;
     if (!rx->fec_enabled) {
-        push_mfsk_varicode_bit(rx, b0);
-        push_mfsk_varicode_bit(rx, b1);
-        push_mfsk_varicode_bit(rx, b2);
+        push_payload_bit(rx, b0);
+        push_payload_bit(rx, b1);
+        push_payload_bit(rx, b2);
         return;
     }
     if (rx->fec_punctured) {
@@ -2075,10 +2133,17 @@ static float channel_sync_energy(const psk_rtty_rx_t *rx)
 
     float energy = 0.0f;
     for (uint8_t car = 0; car < active; ++car) {
-        const float i = rx->chan_bit_signal[car].x;
-        const float q = rx->chan_bit_signal[car].y;
+        float i = rx->chan_bit_signal[car].x;
+        float q = rx->chan_bit_signal[car].y;
+        /* A two-sample baseband average reduces sensitivity to the integer
+         * sampling grid at 13 samples/symbol without averaging constellation
+         * decisions or mixing the two carriers. Both samples are after AGC. */
+        if (rx->config.mode == PSK_RTTY_MODE_2X8PSK1200F) {
+            i = 0.5f * (i + rx->chan_prev_bit_signal[car].x);
+            q = 0.5f * (q + rx->chan_prev_bit_signal[car].y);
+        }
         const float power = i * i + q * q;
-        energy += (rx->config.mode == PSK_RTTY_MODE_8PSK1200F || rx->config.mode == PSK_RTTY_MODE_2X8PSK1200F) ? sqrtf(power) : power;
+        energy += (rx->config.mode == PSK_RTTY_MODE_8PSK1200F || rx->config.mode == PSK_RTTY_MODE_2X8PSK1200F || fec_is_k16_8psk(rx)) ? sqrtf(power) : power;
     }
 
     return energy / (float)active;
@@ -2164,8 +2229,13 @@ static PSK_FAST_TEXT void finish_channel_psk_symbol(psk_rtty_rx_t *rx)
     const float phase_step = TWO_PI / (float)phase_states;
 
     for (uint8_t car = 0; car < active; ++car) {
-        const float i = rx->chan_bit_signal[car].x;
-        const float q = rx->chan_bit_signal[car].y;
+        float i = rx->chan_bit_signal[car].x;
+        float q = rx->chan_bit_signal[car].y;
+        /* Use the same smoothed sample as the timing-energy detector. */
+        if (rx->config.mode == PSK_RTTY_MODE_2X8PSK1200F) {
+            i = 0.5f * (i + rx->chan_prev_bit_signal[car].x);
+            q = 0.5f * (q + rx->chan_prev_bit_signal[car].y);
+        }
         const float mag = sqrtf(i * i + q * q);
 
         if (rx->carrier_has_prev[car]) {
