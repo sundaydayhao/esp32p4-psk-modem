@@ -42,6 +42,7 @@ static void count_drop(void)
 void content_get_status(content_status_t *status)
 {
     portENTER_CRITICAL(&s_lock); *status = s_status; portEXIT_CRITICAL(&s_lock);
+    status->voice_tx_pending = s_packets ? uxQueueMessagesWaiting(s_packets) : 0;
 }
 void content_copy_image(uint8_t *pixels, content_status_t *status)
 {
@@ -156,7 +157,17 @@ int content_voice_tx_fetch(void *user)
             stream->packet = item.packet; stream->offset = 0; break;
         }
     }
-    return stream->offset < stream->packet.len ? stream->packet.data[stream->offset++] : -1;
+    if (stream->offset >= stream->packet.len) return -1;
+    const int byte = stream->packet.data[stream->offset++];
+    if (stream->offset == stream->packet.len) {
+        portENTER_CRITICAL(&s_lock);
+        if (s_status.epoch == stream->epoch) {
+            ++s_status.voice_tx_packets;
+            s_status.voice_tx_bytes += stream->packet.len;
+        }
+        portEXIT_CRITICAL(&s_lock);
+    }
+    return byte;
 }
 
 static void enqueue_packet(const voice_packet_t *packet, void *user)
@@ -180,12 +191,14 @@ static void uart_task(void *arg)
     ap580_playout_t playout;
     uart_tx_pump_t pump = {0};
     uint32_t applied_epoch = UINT32_MAX;
+    uint32_t uart_rx_bytes = 0;
     ap580_playout_reset(&playout, AP580_CODEC_RATE_DEFAULT, 0);
     for (;;) {
         session_t session = session_get();
         const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
         if (applied_epoch != session.epoch) {
             applied_epoch = session.epoch;
+            uart_rx_bytes = 0;
             memset(&rx, 0, sizeof(rx)); uart_tx_pump_cancel(&pump);
             (void)uart_wait_tx_done(UART_NUM_1, pdMS_TO_TICKS(UART_TX_PUMP_TIMEOUT_MS));
             memset(&pump, 0, sizeof(pump));
@@ -194,6 +207,7 @@ static void uart_task(void *arg)
         }
         uint8_t bytes[64];
         const int n = uart_read_bytes(UART_NUM_1, bytes, sizeof(bytes), 0);
+        if (n > 0) uart_rx_bytes += (uint32_t)n;
         if (n > 0 && session.type == CONTENT_AUDIO && session.transmit && session.active)
             voice_uart_feed(&rx, bytes, (size_t)n, session.rate, now, enqueue_packet, &session);
         if (session.type == CONTENT_AUDIO && session.transmit && session.active)
@@ -214,6 +228,8 @@ static void uart_task(void *arg)
         portENTER_CRITICAL(&s_lock);
         if (s_status.epoch == session.epoch) {
             s_status.uart_rx_frames = rx.accepted; s_status.uart_bad_length = rx.bad_length;
+            s_status.uart_rx_bytes = uart_rx_bytes;
+            s_status.uart_sync_drops = rx.sync_drops; s_status.uart_non_voice = rx.non_voice;
             s_status.uart_tx_frames = pump.completed_frames; s_status.uart_timeouts = pump.timeouts;
             if (session.transmit && rx.accepted) memcpy(s_status.last_voice_frame, rx.uart, 16);
         }

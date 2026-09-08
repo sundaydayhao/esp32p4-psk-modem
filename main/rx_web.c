@@ -121,6 +121,13 @@ static esp_err_t status_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(json, "voice_frames", cs.voice_frames);
     cJSON_AddNumberToObject(json, "voice_crc_errors", cs.voice_crc_errors);
     cJSON_AddNumberToObject(json, "uart_rx_frames", cs.uart_rx_frames);
+    cJSON_AddNumberToObject(json, "uart_rx_bytes", cs.uart_rx_bytes);
+    cJSON_AddNumberToObject(json, "uart_bad_length", cs.uart_bad_length);
+    cJSON_AddNumberToObject(json, "uart_sync_drops", cs.uart_sync_drops);
+    cJSON_AddNumberToObject(json, "uart_non_voice", cs.uart_non_voice);
+    cJSON_AddNumberToObject(json, "voice_tx_packets", cs.voice_tx_packets);
+    cJSON_AddNumberToObject(json, "voice_tx_bytes", cs.voice_tx_bytes);
+    cJSON_AddNumberToObject(json, "voice_tx_pending", cs.voice_tx_pending);
     cJSON_AddNumberToObject(json, "uart_tx_frames", cs.uart_tx_frames);
     cJSON_AddNumberToObject(json, "uart_timeouts", cs.uart_timeouts);
     cJSON_AddNumberToObject(json, "queue_drops", cs.queue_drops);

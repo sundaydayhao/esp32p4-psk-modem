@@ -9,6 +9,8 @@ typedef struct {
     uint32_t epoch, image_version, image_rows, image_bad_rows, image_completed;
     uint32_t voice_rate, voice_packets, voice_frames, voice_crc_errors, voice_resyncs;
     uint32_t uart_rx_frames, uart_bad_length, uart_tx_frames, uart_timeouts, queue_drops;
+    uint32_t uart_rx_bytes, uart_sync_drops, uart_non_voice;
+    uint32_t voice_tx_packets, voice_tx_bytes, voice_tx_pending;
     uint8_t last_voice_frame[16];
     bool uart_ready;
 } content_status_t;

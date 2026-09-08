@@ -261,6 +261,12 @@ static void apply_control_event(modem_t *modem, const ui_event_t *event)
                  (unsigned long)cs.image_rows, (unsigned long)cs.image_bad_rows, (unsigned long)cs.voice_frames,
                  (unsigned long)cs.voice_packets, (unsigned long)cs.voice_crc_errors,
                  cs.uart_ready ? "ready" : "unconfigured", (unsigned long)cs.uart_rx_frames, (unsigned long)cs.uart_tx_frames);
+        ESP_LOGI(TAG, "ap580 tx_packets=%lu tx_bytes=%lu pending=%lu drops=%lu uart_bytes=%lu badlen=%lu syncdrop=%lu nonvoice=%lu timeouts=%lu rate=%lu",
+                 (unsigned long)cs.voice_tx_packets, (unsigned long)cs.voice_tx_bytes,
+                 (unsigned long)cs.voice_tx_pending, (unsigned long)cs.queue_drops,
+                 (unsigned long)cs.uart_rx_bytes, (unsigned long)cs.uart_bad_length,
+                 (unsigned long)cs.uart_sync_drops, (unsigned long)cs.uart_non_voice,
+                 (unsigned long)cs.uart_timeouts, (unsigned long)cs.voice_rate);
         rx_web_status_t performance; rx_web_get_status(&performance);
         ESP_LOGI(TAG, "perf load=%u.%u%% max=%u/%uus late=%lu samples/s=%u readerr=%lu image_completed=%lu",
             performance.dsp_load_permille / 10, performance.dsp_load_permille % 10,
