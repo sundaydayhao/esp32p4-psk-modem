@@ -95,7 +95,7 @@ static int16_t s_tx_samples[PSK_TX_CHUNK_SAMPLES] EXT_RAM_BSS_ATTR;
 #endif
 /* Only audio_task applies controls. TX owns its modulator; UART owns its driver. */
 static tx_cmd_t s_settings = {.mode = PSK_MODE_BPSK31, .tone_hz = 2000,
-    .dac_volume = 70, .hp_volume = 70, .content = CONTENT_TEXT,
+    .dac_volume = 70, .hp_volume = BOARD_AUDIO_OUTPUT_VOLUME, .content = CONTENT_TEXT,
     .codec_rate = DEFAULT_VOICE_RATE, .text = TX_TEXT_DEFAULT};
 
 static void waterfall_stream_init(waterfall_stream_t *stream);

@@ -23,7 +23,7 @@ static esp_codec_dev_handle_t s_spk_dev;
 static audio_decim_state_t s_decim_state;
 static int16_t s_raw_samples[1536];
 static uint8_t s_dac_volume = 70;
-static uint8_t s_headphone_volume = 70;
+static uint8_t s_headphone_volume = BOARD_AUDIO_OUTPUT_VOLUME;
 static float s_input_gain_db = BOARD_AUDIO_INPUT_GAIN_DB;
 
 #define AUDIO_INPUT_CAPTURE_MAX_SAMPLES (48000U * 40U)
