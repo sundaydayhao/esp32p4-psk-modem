@@ -32,7 +32,7 @@ menu "AP580 voice module"
         default 115200
     choice PSK_AP580_RATE
         prompt "AP580 transmit codec profile (must match physical module)"
-        default PSK_AP580_RATE_600
+        default PSK_AP580_RATE_2400
         config PSK_AP580_RATE_600
             bool "600 bit/s"
         config PSK_AP580_RATE_1200

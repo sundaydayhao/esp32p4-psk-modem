@@ -6,16 +6,13 @@
 #include <string.h>
 
 #include "audio_input.h"
-#include "board_config.h"
 #include "display.h"
-#include "driver/gpio.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_log.h"
 #include "esp_crc.h"
 #include "psk_modes.h"
 
 static const char *TAG = "ui";
-static int s_last_sw1 = 1;
 static char s_serial_cmd[320];
 static size_t s_serial_cmd_len;
 static int s_dump_pending;
@@ -23,54 +20,10 @@ static int s_dump_pending;
 #define UI_TX_TEXT_DEFAULT \
     "CQ CQ CQ DE HPM6750 PSK MODEM. THIS IS A CONTINUOUS BOARD TO BOARD AUDIO LINK TEST AT 2000 HZ. COPY THE QUICK BROWN FOX 0123456789.\n"
 
-typedef enum {
-    UI_CYCLE_KIND_PSK,
-    UI_CYCLE_KIND_MODE,
-} ui_cycle_kind_t;
-
-typedef struct {
-    ui_cycle_kind_t kind;
-    union {
-        psk_mode_t psk_mode;
-        modem_mode_t modem_mode;
-    } value;
-} ui_cycle_item_t;
-
 typedef struct {
     const char *label;
     const char *text;
 } tx_text_preset_t;
-
-static const ui_cycle_item_t s_mode_cycle[] = {
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_BPSK31 } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_BPSK63 } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_BPSK63F } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_BPSK125 } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_BPSK250 } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_BPSK500 } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_BPSK1000 } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_12XPSK125 } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_6XPSK250 } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_2XPSK500 } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_4XPSK500 } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_2XPSK800 } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_2XPSK1000 } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_QPSK31 } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_QPSK63 } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_QPSK125 } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_QPSK250 } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_QPSK500 } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_8PSK125 } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_8PSK250 } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_8PSK500 } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_8PSK1000 } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_8PSK125F } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_8PSK250F } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_8PSK500F } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_8PSK1000F } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_8PSK1200F } },
-    { UI_CYCLE_KIND_PSK,  { .psk_mode = PSK_MODE_2X8PSK1200F } },
-};
 
 static const tx_text_preset_t s_tx_text_presets[] = {
     {
@@ -90,51 +43,6 @@ static const tx_text_preset_t s_tx_text_presets[] = {
         "LONG LOOP MESSAGE: HPM6750 DUAL BOARD PSK TEXT SELECTOR IS RUNNING. AUDIO RATE IS FIXED AT 48 KHZ. MODE CHANGES SEND NEW SYNC; TEXT LOOPS CONTINUOUSLY\n",
     },
 };
-
-static int cycle_item_matches(const display_state_t *state, const ui_cycle_item_t *item)
-{
-    if (state->display_role) return item->kind == UI_CYCLE_KIND_PSK && state->selected_tx_psk_mode == item->value.psk_mode;
-    if (item->kind == UI_CYCLE_KIND_MODE) {
-        return state->selected_mode == item->value.modem_mode;
-    }
-    if (item->value.psk_mode == PSK_MODE_BPSK31) {
-        return state->selected_mode == MODEM_MODE_BPSK31 && state->selected_psk_mode == PSK_MODE_BPSK31;
-    }
-    return state->selected_mode == MODEM_MODE_PSK63 && state->selected_psk_mode == item->value.psk_mode;
-}
-
-static ui_event_t cycle_next_mode(const display_state_t *state)
-{
-    if (state->content_type == CONTENT_AUDIO) return (ui_event_t){.type = UI_EVENT_NONE};
-    const size_t count = sizeof(s_mode_cycle) / sizeof(s_mode_cycle[0]);
-    size_t current = 0;
-    for (size_t i = 0; i < count; ++i) {
-        if (cycle_item_matches(state, &s_mode_cycle[i])) {
-            current = i;
-            break;
-        }
-    }
-
-    const ui_cycle_item_t *next = NULL;
-    for (size_t step = 1; step <= count; ++step) {
-        const ui_cycle_item_t *item = &s_mode_cycle[(current + step) % count];
-        if (state->content_type == CONTENT_IMAGE &&
-            (item->kind != UI_CYCLE_KIND_PSK || !modem_image_mode_allowed(item->value.psk_mode))) continue;
-        next = item; break;
-    }
-    if (!next) return (ui_event_t){.type = UI_EVENT_NONE};
-    ui_event_t event = { .type = next->kind == UI_CYCLE_KIND_PSK ? UI_EVENT_PSK_MODE_CHANGED : UI_EVENT_MODE_CHANGED };
-    if (next->kind == UI_CYCLE_KIND_PSK) {
-        event.psk_mode = next->value.psk_mode;
-        if (state->display_role) {
-            event.type = UI_EVENT_TX_MODE_CHANGED;
-            event.tx_psk_mode = next->value.psk_mode;
-        }
-    } else {
-        event.mode = next->value.modem_mode;
-    }
-    return event;
-}
 
 static int cmd_equals(const char *a, const char *b)
 {
@@ -562,15 +470,7 @@ esp_err_t ui_init(void)
         ESP_LOGW(TAG, "USB serial/JTAG RX driver not installed: %s", esp_err_to_name(usb_err));
     }
 
-    gpio_config_t io = {
-        .pin_bit_mask = 1ULL << BOARD_SW1_GPIO,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&io));
-    ESP_LOGI(TAG, "SW1 on GPIO%d; touch backend placeholder", BOARD_SW1_GPIO);
+    ESP_LOGI(TAG, "LCD and USB controls ready; no GPIO button input");
     return ESP_OK;
 }
 
@@ -614,13 +514,6 @@ ui_event_t ui_poll(const display_state_t *display_state)
         event.tone_hz = tone_hz;
         return event;
     }
-
-    const int sw1 = gpio_get_level(BOARD_SW1_GPIO);
-    if (s_last_sw1 == 1 && sw1 == 0) {
-        s_last_sw1 = sw1;
-        return cycle_next_mode(display_state);
-    }
-    s_last_sw1 = sw1;
 
     return event;
 }

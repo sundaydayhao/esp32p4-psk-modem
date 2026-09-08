@@ -167,6 +167,7 @@ static void select_content(modem_t *modem, content_type_t type)
     if (type == CONTENT_AUDIO) {
         modem_set_psk_mode(modem, PSK_MODE_2X8PSK1200F); s_settings.mode = PSK_MODE_2X8PSK1200F;
         modem_set_rx_tone(modem, 2000); s_settings.tone_hz = 2000;
+        if (s_display_role) s_settings.enabled = true;
     } else if (type == CONTENT_IMAGE) {
         if (!modem_image_mode_allowed(modem_get_psk_mode(modem)))
             modem_set_psk_mode(modem, PSK_MODE_2X8PSK1200F);
@@ -424,9 +425,10 @@ static void tx_task(void *arg)
         if (config.enabled && !psk_tx_active(tx)) {
             int rc = 0;
             if (config.content == CONTENT_AUDIO) {
-                if (content_voice_tx_ready(config.epoch))
-                    rc = psk_tx_start_binary_stream(tx, PSK_MODE_2X8PSK1200F, config.tone_hz,
-                                                   content_voice_tx_fetch, &voice_stream);
+                /* Run continuously, including before UART data arrives. The
+                 * binary stream inserts idle bytes until AP580 packets exist. */
+                rc = psk_tx_start_binary_stream(tx, PSK_MODE_2X8PSK1200F, config.tone_hz,
+                                               content_voice_tx_fetch, &voice_stream);
             } else if (config.content == CONTENT_IMAGE) {
                 rc = psk_tx_start_stream(tx, config.mode, config.tone_hz, modem_image_tx_stream_fetch, &image_stream);
             } else rc = psk_tx_start_text_loop(tx, config.mode, config.tone_hz, config.text);

@@ -27,5 +27,4 @@ void content_begin(content_type_t type, bool transmit, bool active, uint32_t rat
 bool content_receive(const uint8_t *data, size_t len); /* true requests binary sync reacquisition */
 void content_get_status(content_status_t *status);
 void content_copy_image(uint8_t *pixels, content_status_t *status);
-bool content_voice_tx_ready(uint32_t epoch);
 int content_voice_tx_fetch(void *stream);

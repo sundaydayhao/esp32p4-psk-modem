@@ -126,6 +126,12 @@ static int fetch(void *user)
     (void)user;
     return stream_pos < stream_len ? stream[stream_pos++] : 0;
 }
+static size_t available_bytes;
+static int live_fetch(void *user)
+{
+    (void)user;
+    return stream_pos < available_bytes ? stream[stream_pos++] : -1;
+}
 static void setup(int binary)
 {
     psk_tx_init(&tx, 48000);
@@ -173,6 +179,34 @@ static void image_roundtrip(void)
     printf("PASS PSK image: all 96 CRC rows / 9216 pixels exact, bad rows %lu, %.3f audio seconds\n",
         (unsigned long)image_rx.total_invalid_rows, samples / 48000.0);
 }
+static void voice_idle_resume(uint32_t rate)
+{
+    const unsigned group = rate == 1200 ? 8 : 6, count = group * 4;
+    make_frames(rate, count);
+    stream_pos = stream_len = available_bytes = 0;
+    size_t first_burst = 0;
+    for (unsigned i = 0; i < count; i += group) {
+        voice_packet_t packet;
+        assert(voice_encode(rate, expected + i * 16, group, &packet));
+        memcpy(stream + stream_len, packet.data, packet.len); stream_len += packet.len;
+        if (i == group) first_burst = stream_len;
+    }
+    memset(&wire_rx, 0, sizeof(wire_rx)); setup(1);
+    assert(!psk_tx_start_binary_stream(&tx, PSK_MODE_2X8PSK1200F, 2000, live_fetch, NULL));
+    for (uint32_t samples = 0; samples < 48000 * 10; samples += 256) {
+        available_bytes = samples < 48000 ? 0 : samples < 48000 * 6 ? first_burst : stream_len;
+        int16_t pcm[256]; char out[256];
+        assert(psk_tx_generate(&tx, pcm, 256) == 256 && psk_tx_active(&tx));
+        const size_t n = psk_rx_process(&rx, pcm, 256, out, sizeof(out));
+        voice_wire_feed(&wire_rx, (const uint8_t *)out, n, frames_cb, NULL);
+        if (samples < 48000) assert(received == 0); /* idle isn't a voice frame */
+        if (samples >= 48000 * 5 && samples < 48000 * 6)
+            assert(received == group * 2 * VOICE_FRAME_BYTES);
+    }
+    assert(received == count * VOICE_FRAME_BYTES && wire_rx.packets == 4 && wire_rx.crc_errors == 0);
+    printf("PASS continuous AP580 %lu: empty startup, two bursts, idle gap, exact frames, TX remains active\n",
+           (unsigned long)rate);
+}
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -180,6 +214,7 @@ int main(void)
     const uint32_t rates[] = {600, 1200, 2400};
     for (unsigned i = 0; i < 3; ++i) voice_protocol(rates[i]);
     for (unsigned i = 0; i < 3; ++i) voice_roundtrip(rates[i]);
+    for (unsigned i = 0; i < 3; ++i) voice_idle_resume(rates[i]);
     image_roundtrip();
     puts("PASS: finite ideal-channel validation; physical link BER and audible speech need hardware tests");
     return 0;

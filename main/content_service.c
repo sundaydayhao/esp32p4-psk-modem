@@ -138,15 +138,6 @@ bool content_receive(const uint8_t *data, size_t len)
     return false;
 }
 
-bool content_voice_tx_ready(uint32_t epoch)
-{
-    packet_item_t packet;
-    while (xQueuePeek(s_packets, &packet, 0) == pdTRUE) {
-        if (packet.epoch == epoch) return true;
-        (void)xQueueReceive(s_packets, &packet, 0);
-    }
-    return false;
-}
 int content_voice_tx_fetch(void *user)
 {
     voice_tx_stream_t *stream = user;
