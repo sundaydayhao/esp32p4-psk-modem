@@ -268,6 +268,7 @@ static void apply_control_event(modem_t *modem, const ui_event_t *event)
                  (unsigned long)cs.uart_rx_bytes, (unsigned long)cs.uart_bad_length,
                  (unsigned long)cs.uart_sync_drops, (unsigned long)cs.uart_non_voice,
                  (unsigned long)cs.uart_timeouts, (unsigned long)cs.voice_rate);
+        content_dump_uart_diagnostics();
         rx_web_status_t performance; rx_web_get_status(&performance);
         ESP_LOGI(TAG, "perf load=%u.%u%% max=%u/%uus late=%lu samples/s=%u readerr=%lu image_completed=%lu",
             performance.dsp_load_permille / 10, performance.dsp_load_permille % 10,

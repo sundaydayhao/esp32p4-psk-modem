@@ -16,6 +16,7 @@ typedef struct { uint8_t data[16]; uint32_t epoch, rate; } frame_item_t;
 typedef struct { content_type_t type; bool transmit, active; uint32_t rate, epoch; } session_t;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static QueueHandle_t s_packets, s_frames;
+static QueueHandle_t s_uart_events;
 static session_t s_session;
 static content_status_t s_status;
 static uint8_t s_pixels[MODEM_IMAGE_PIXEL_COUNT];
@@ -43,6 +44,23 @@ void content_get_status(content_status_t *status)
 {
     portENTER_CRITICAL(&s_lock); *status = s_status; portEXIT_CRITICAL(&s_lock);
     status->voice_tx_pending = s_packets ? uxQueueMessagesWaiting(s_packets) : 0;
+}
+void content_dump_uart_diagnostics(void)
+{
+#if CONFIG_PSK_AP580_UART_ENABLED
+    content_status_t status;
+    content_get_status(&status);
+    if (!status.uart_ready) return;
+    uint32_t baud = 0;
+    const esp_err_t err = uart_get_baudrate(UART_NUM_1, &baud);
+    ESP_LOGI("content", "UART1 baud=%lu (%s) TX=GPIO%d RX=GPIO%d level=%d low_samples=%lu/%lu frameerr=%lu parityerr=%lu overflow=%lu",
+        (unsigned long)baud, esp_err_to_name(err), CONFIG_PSK_AP580_TX_GPIO, CONFIG_PSK_AP580_RX_GPIO,
+        gpio_get_level(CONFIG_PSK_AP580_RX_GPIO), (unsigned long)status.uart_rx_low_samples,
+        (unsigned long)status.uart_rx_samples, (unsigned long)status.uart_frame_errors,
+        (unsigned long)status.uart_parity_errors, (unsigned long)status.uart_overflows);
+    (void)gpio_dump_io_configuration(stdout,
+        (1ULL << CONFIG_PSK_AP580_TX_GPIO) | (1ULL << CONFIG_PSK_AP580_RX_GPIO));
+#endif
 }
 void content_copy_image(uint8_t *pixels, content_status_t *status)
 {
@@ -183,6 +201,8 @@ static void uart_task(void *arg)
     uart_tx_pump_t pump = {0};
     uint32_t applied_epoch = UINT32_MAX;
     uint32_t uart_rx_bytes = 0;
+    uint32_t rx_samples = 0, rx_low_samples = 0;
+    uint32_t frame_errors = 0, parity_errors = 0, overflows = 0;
     ap580_playout_reset(&playout, AP580_CODEC_RATE_DEFAULT, 0);
     for (;;) {
         session_t session = session_get();
@@ -190,11 +210,23 @@ static void uart_task(void *arg)
         if (applied_epoch != session.epoch) {
             applied_epoch = session.epoch;
             uart_rx_bytes = 0;
+            rx_samples = rx_low_samples = frame_errors = parity_errors = overflows = 0;
             memset(&rx, 0, sizeof(rx)); uart_tx_pump_cancel(&pump);
             (void)uart_wait_tx_done(UART_NUM_1, pdMS_TO_TICKS(UART_TX_PUMP_TIMEOUT_MS));
             memset(&pump, 0, sizeof(pump));
             (void)uart_flush_input(UART_NUM_1);
+            xQueueReset(s_uart_events);
             ap580_playout_reset(&playout, session.rate, now);
+        }
+        /* Sample the line without changing its mux or pull configuration.
+         * These are task samples, not edge counts or a logic-analyzer trace. */
+        ++rx_samples;
+        if (!gpio_get_level(CONFIG_PSK_AP580_RX_GPIO)) ++rx_low_samples;
+        uart_event_t event;
+        for (unsigned i = 0; i < 16 && xQueueReceive(s_uart_events, &event, 0) == pdTRUE; ++i) {
+            if (event.type == UART_FRAME_ERR) ++frame_errors;
+            else if (event.type == UART_PARITY_ERR) ++parity_errors;
+            else if (event.type == UART_FIFO_OVF || event.type == UART_BUFFER_FULL) ++overflows;
         }
         uint8_t bytes[64];
         const int n = uart_read_bytes(UART_NUM_1, bytes, sizeof(bytes), 0);
@@ -220,6 +252,9 @@ static void uart_task(void *arg)
         if (s_status.epoch == session.epoch) {
             s_status.uart_rx_frames = rx.accepted; s_status.uart_bad_length = rx.bad_length;
             s_status.uart_rx_bytes = uart_rx_bytes;
+            s_status.uart_rx_samples = rx_samples; s_status.uart_rx_low_samples = rx_low_samples;
+            s_status.uart_frame_errors = frame_errors; s_status.uart_parity_errors = parity_errors;
+            s_status.uart_overflows = overflows;
             s_status.uart_sync_drops = rx.sync_drops; s_status.uart_non_voice = rx.non_voice;
             s_status.uart_tx_frames = pump.completed_frames; s_status.uart_timeouts = pump.timeouts;
             if (session.transmit && rx.accepted) memcpy(s_status.last_voice_frame, rx.uart, 16);
@@ -245,7 +280,7 @@ esp_err_t content_service_init(void)
     esp_err_t err = uart_param_config(UART_NUM_1, &cfg);
     if (err == ESP_OK) err = uart_set_pin(UART_NUM_1, CONFIG_PSK_AP580_TX_GPIO,
         CONFIG_PSK_AP580_RX_GPIO, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    if (err == ESP_OK) err = uart_driver_install(UART_NUM_1, 2048, 0, 0, NULL, 0);
+    if (err == ESP_OK) err = uart_driver_install(UART_NUM_1, 2048, 0, 16, &s_uart_events, 0);
     if (err != ESP_OK) return err;
     s_status.uart_ready = true;
     if (xTaskCreatePinnedToCore(uart_task, "ap580_uart", 4096, NULL, 5, NULL, 1) != pdPASS)
